@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import math
@@ -9,21 +9,24 @@ import pandas as pd
 
 
 # =============================================================================
-# EMA DISTANCE CALIBRATION RESEARCH MODULE
+# SMARTCHART • EMA DISTANCE CALIBRATION PARITY
+# File: cc_ema_distance_calibration.py
 # =============================================================================
-# Purpose:
-# - Research the percentage distance between EMA20 and EMA200
-# - Bucket that distance into ranges
-# - Test forward continuation vs reversal outcomes after a signal
-# - Recommend Zone 1 / Zone 2 / Zone 3 thresholds from observed data
+# Purpose
+# - Strict Pine-authority parity for EMA20 vs EMA200 percentage distance
+# - Preserve lower-pane research structure for future visual use
+# - Add forward continuation/reversal calibration research
 #
-# Designed to be instrument-agnostic:
-# - Works on any instrument and timeframe
-# - Uses configurable target/stop distances in price points
-# - Uses configurable bucket definitions and forward horizon
-#
-# Pine parity anchor:
-# e20ToE200Pct = ((ema20 - ema200) / ema200) * 100.0
+# Pine reference structure preserved:
+# 1. Inputs / Config
+# 2. EMA Core
+# 3. Distance Engine
+# 4. Signal Filter Engine
+# 5. Bucket Engine
+# 6. Stage Engine
+# 7. Export / Status Outputs
+# 8. Research Forward Test Engine
+# 9. Bucket Statistics + Zone Recommendation
 # =============================================================================
 
 
@@ -33,54 +36,75 @@ import pandas as pd
 
 @dataclass
 class CalibrationConfig:
-    # EMA settings
+    # -------------------------------------------------------------------------
+    # Core
+    # -------------------------------------------------------------------------
     ema_fast_len: int = 20
     ema_slow_len: int = 200
     slope_len: int = 5
 
+    # -------------------------------------------------------------------------
     # Signal filters
+    # -------------------------------------------------------------------------
     require_price_on_trend_side: bool = True
-    require_fast_slope_confirmation: bool = True
-    require_slow_slope_confirmation: bool = False
+    require_fast_slope_confirm: bool = True
+    require_slow_slope_confirm: bool = False
     min_abs_distance_pct: float = 0.0
 
-    # Forward test definition
+    # -------------------------------------------------------------------------
+    # Pine bucket boundaries
+    # Matches Pine script defaults exactly:
+    # b1=0.00, b2=0.25, b3=0.50, b4=0.75, b5=1.00,
+    # b6=1.25, b7=1.50, b8=2.00, b9=2.50, b10=3.00
+    # -------------------------------------------------------------------------
+    bucket_edges_pct: Tuple[float, ...] = (
+        0.00,
+        0.25,
+        0.50,
+        0.75,
+        1.00,
+        1.25,
+        1.50,
+        2.00,
+        2.50,
+        3.00,
+        math.inf,
+    )
+
+    # -------------------------------------------------------------------------
+    # Pine stage thresholds
+    # -------------------------------------------------------------------------
+    zone1_max_pct: float = 0.75
+    zone2_max_pct: float = 1.50
+    zone3_min_pct: float = 1.50
+
+    # -------------------------------------------------------------------------
+    # Forward test research
+    # -------------------------------------------------------------------------
     continuation_points: float = 60.0
     reversal_points: float = 30.0
     max_forward_bars: int = 60
 
-    # Instrument scaling
-    # For XAUUSD many users think in "points" as raw price units like 0.01, 0.10, 1.0 etc.
-    # This parameter converts user-defined points into price units used by the dataframe.
+    # -------------------------------------------------------------------------
+    # Instrument point conversion
     # Example:
-    # - If 1 point = 0.01 price units, set point_value=0.01
-    # - If 1 point = 1.0 price units, set point_value=1.0
+    # - point_value=0.01 for XAUUSD if 1 point = 0.01 price units
+    # - point_value=1.0  if 1 point = 1.0 price units
+    # -------------------------------------------------------------------------
     point_value: float = 1.0
 
-    bucket_edges_pct: Tuple[float, ...] = (
-    0.00,
-    0.05,
-    0.10,
-    0.15,
-    0.20,
-    0.30,
-    0.50,
-    0.75,
-    1.00,
-    1.50,
-    2.00,
-    3.00,
-    math.inf,
-)
-    
+    # -------------------------------------------------------------------------
     # Recommendation engine
+    # -------------------------------------------------------------------------
     min_bucket_samples: int = 200
     zone1_min_continuation_rate: float = 0.58
     zone2_min_continuation_rate: float = 0.52
     max_zone1_reversal_rate: float = 0.34
     max_zone2_reversal_rate: float = 0.42
 
+    # -------------------------------------------------------------------------
     # Column names
+    # -------------------------------------------------------------------------
     open_col: str = "open"
     high_col: str = "high"
     low_col: str = "low"
@@ -93,13 +117,14 @@ class CalibrationConfig:
 # =============================================================================
 
 def ema(series: pd.Series, length: int) -> pd.Series:
-    """EMA helper with min_periods aligned to TradingView-style warmup behavior."""
+    """EMA helper with TradingView-style warmup alignment."""
     return series.ewm(span=length, adjust=False, min_periods=length).mean()
 
 
 def pct_change_from_past(series: pd.Series, lookback: int) -> pd.Series:
     prev = series.shift(lookback)
-    return np.where(prev != 0.0, ((series - prev) / prev) * 100.0, np.nan)
+    out = np.where(prev != 0.0, ((series - prev) / prev) * 100.0, np.nan)
+    return pd.Series(out, index=series.index, dtype=float)
 
 
 def validate_ohlc(df: pd.DataFrame, cfg: CalibrationConfig) -> None:
@@ -107,8 +132,13 @@ def validate_ohlc(df: pd.DataFrame, cfg: CalibrationConfig) -> None:
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing OHLC columns: {missing}")
-    if len(df) < max(cfg.ema_slow_len, cfg.max_forward_bars) + cfg.slope_len + 5:
-        raise ValueError("Not enough rows for EMA warmup and forward testing.")
+
+    min_rows = max(cfg.ema_slow_len, cfg.max_forward_bars) + cfg.slope_len + 5
+    if len(df) < min_rows:
+        raise ValueError(
+            f"Not enough rows for EMA warmup and forward testing. "
+            f"Need at least {min_rows}, got {len(df)}."
+        )
 
 
 def build_bucket_labels(edges: Sequence[float]) -> List[str]:
@@ -119,29 +149,19 @@ def build_bucket_labels(edges: Sequence[float]) -> List[str]:
         if math.isinf(right):
             labels.append(f"{left:.2f}%+")
         else:
-            labels.append(f"{left:.2f}%–{right:.2f}%")
+            labels.append(f"{left:.2f}-{right:.2f}%")
     return labels
-
-
-def bucketize_abs_distance(abs_distance_pct: pd.Series, edges: Sequence[float]) -> pd.Categorical:
-    labels = build_bucket_labels(edges)
-    return pd.cut(
-        abs_distance_pct,
-        bins=list(edges),
-        labels=labels,
-        include_lowest=True,
-        right=False,
-        ordered=True,
-    )
 
 
 def contiguous_ranges(sorted_indices: Iterable[int]) -> List[Tuple[int, int]]:
     idx = list(sorted(set(int(i) for i in sorted_indices)))
     if not idx:
         return []
+
     ranges: List[Tuple[int, int]] = []
     start = idx[0]
     prev = idx[0]
+
     for i in idx[1:]:
         if i == prev + 1:
             prev = i
@@ -149,15 +169,126 @@ def contiguous_ranges(sorted_indices: Iterable[int]) -> List[Tuple[int, int]]:
         ranges.append((start, prev))
         start = i
         prev = i
+
     ranges.append((start, prev))
     return ranges
 
 
+def _bucket_index_from_abs_dist(abs_dist: pd.Series, edges: Sequence[float]) -> pd.Series:
+    """
+    Pine-style bucket index:
+    0 = NA
+    1 = [b1,b2)
+    2 = [b2,b3)
+    ...
+    9 = [b9,b10)
+    10 = [b10,inf)
+    """
+    values = abs_dist.to_numpy(dtype=float)
+    out = np.zeros(len(values), dtype=int)
+
+    finite_edges = list(edges[:-1])  # exclude inf for the comparisons
+    # For Pine equivalence, compare against upper edges only:
+    # < b2 => 1, < b3 => 2, ... else 10
+    if len(finite_edges) < 10:
+        raise ValueError("bucket_edges_pct must include Pine-style edges plus infinity.")
+
+    for i, v in enumerate(values):
+        if np.isnan(v):
+            out[i] = 0
+        elif v < finite_edges[1]:
+            out[i] = 1
+        elif v < finite_edges[2]:
+            out[i] = 2
+        elif v < finite_edges[3]:
+            out[i] = 3
+        elif v < finite_edges[4]:
+            out[i] = 4
+        elif v < finite_edges[5]:
+            out[i] = 5
+        elif v < finite_edges[6]:
+            out[i] = 6
+        elif v < finite_edges[7]:
+            out[i] = 7
+        elif v < finite_edges[8]:
+            out[i] = 8
+        elif v < finite_edges[9]:
+            out[i] = 9
+        else:
+            out[i] = 10
+
+    return pd.Series(out, index=abs_dist.index, dtype=int)
+
+
+def _bucket_text_from_index(bucket_index: pd.Series, edges: Sequence[float]) -> pd.Series:
+    labels = build_bucket_labels(edges)
+
+    mapping: Dict[int, str] = {
+        1: labels[0],
+        2: labels[1],
+        3: labels[2],
+        4: labels[3],
+        5: labels[4],
+        6: labels[5],
+        7: labels[6],
+        8: labels[7],
+        9: labels[8],
+        10: labels[9],
+        0: "NA",
+    }
+    return bucket_index.map(mapping).fillna("NA")
+
+
+def _stage_from_abs_dist(abs_dist: pd.Series, cfg: CalibrationConfig) -> pd.Series:
+    """
+    Pine-style stage logic:
+    stage =
+         na(absDistPct) ? 0 :
+         absDistPct < zone1MaxPct ? 1 :
+         absDistPct < zone2MaxPct ? 2 :
+         absDistPct >= zone3MinPct ? 3 : 0
+    """
+    values = abs_dist.to_numpy(dtype=float)
+    out = np.zeros(len(values), dtype=int)
+
+    for i, v in enumerate(values):
+        if np.isnan(v):
+            out[i] = 0
+        elif v < cfg.zone1_max_pct:
+            out[i] = 1
+        elif v < cfg.zone2_max_pct:
+            out[i] = 2
+        elif v >= cfg.zone3_min_pct:
+            out[i] = 3
+        else:
+            out[i] = 0
+
+    return pd.Series(out, index=abs_dist.index, dtype=int)
+
+
+def _stage_text(stage: pd.Series) -> pd.Series:
+    mapping = {
+        0: "NONE",
+        1: "ZONE 1",
+        2: "ZONE 2",
+        3: "ZONE 3",
+    }
+    return stage.map(mapping).fillna("NONE")
+
+
+def _direction_text(v: int) -> str:
+    if v == 1:
+        return "BULL"
+    if v == -1:
+        return "BEAR"
+    return "NEUTRAL"
+
+
 # =============================================================================
-# FEATURE ENGINE
+# EMA CORE (PINE PARITY)
 # =============================================================================
 
-def build_feature_frame(df: pd.DataFrame, cfg: CalibrationConfig) -> pd.DataFrame:
+def build_ema_core(df: pd.DataFrame, cfg: CalibrationConfig) -> pd.DataFrame:
     validate_ohlc(df, cfg)
 
     out = df.copy()
@@ -167,6 +298,31 @@ def build_feature_frame(df: pd.DataFrame, cfg: CalibrationConfig) -> pd.DataFram
     out["ema20"] = ema(close, cfg.ema_fast_len)
     out["ema200"] = ema(close, cfg.ema_slow_len)
 
+    out["ema20_slope_pct"] = pct_change_from_past(out["ema20"], cfg.slope_len)
+    out["ema200_slope_pct"] = pct_change_from_past(out["ema200"], cfg.slope_len)
+
+    out["trend_side"] = np.where(
+        out["ema20"] > out["ema200"],
+        1,
+        np.where(out["ema20"] < out["ema200"], -1, 0),
+    )
+
+    out["price_side_vs_ema20"] = np.where(
+        out[cfg.close_col] > out["ema20"],
+        1,
+        np.where(out[cfg.close_col] < out["ema20"], -1, 0),
+    )
+
+    return out
+
+
+# =============================================================================
+# DISTANCE ENGINE (PINE PARITY)
+# =============================================================================
+
+def build_distance_engine(features: pd.DataFrame, cfg: CalibrationConfig) -> pd.DataFrame:
+    out = features.copy()
+
     out["e20_to_e200_signed"] = out["ema20"] - out["ema200"]
     out["e20_to_e200_pct"] = np.where(
         out["ema200"] != 0.0,
@@ -175,54 +331,110 @@ def build_feature_frame(df: pd.DataFrame, cfg: CalibrationConfig) -> pd.DataFram
     )
     out["abs_e20_to_e200_pct"] = out["e20_to_e200_pct"].abs()
 
-    out["ema20_slope_pct"] = pct_change_from_past(out["ema20"], cfg.slope_len)
-    out["ema200_slope_pct"] = pct_change_from_past(out["ema200"], cfg.slope_len)
+    return out
 
-    out["trend_side"] = np.where(
-        out["ema20"] > out["ema200"], 1,
-        np.where(out["ema20"] < out["ema200"], -1, 0)
+
+# =============================================================================
+# SIGNAL FILTER ENGINE (PINE PARITY)
+# =============================================================================
+
+def build_signal_engine(features: pd.DataFrame, cfg: CalibrationConfig) -> pd.DataFrame:
+    out = features.copy()
+
+    base_signal = (
+        (out["trend_side"] != 0)
+        & out["abs_e20_to_e200_pct"].notna()
+        & (out["abs_e20_to_e200_pct"] >= cfg.min_abs_distance_pct)
     )
 
-    out["price_side_vs_ema20"] = np.where(
-        out[cfg.close_col] > out["ema20"], 1,
-        np.where(out[cfg.close_col] < out["ema20"], -1, 0)
-    )
+    if cfg.require_price_on_trend_side:
+        price_filter = out["price_side_vs_ema20"] == out["trend_side"]
+    else:
+        price_filter = pd.Series(True, index=out.index)
 
-    out["distance_bucket"] = bucketize_abs_distance(out["abs_e20_to_e200_pct"], cfg.bucket_edges_pct)
+    if cfg.require_fast_slope_confirm:
+        fast_slope_filter = np.where(
+            out["trend_side"] == 1,
+            out["ema20_slope_pct"] > 0,
+            out["ema20_slope_pct"] < 0,
+        )
+        fast_slope_filter = pd.Series(fast_slope_filter, index=out.index)
+    else:
+        fast_slope_filter = pd.Series(True, index=out.index)
+
+    if cfg.require_slow_slope_confirm:
+        slow_slope_filter = np.where(
+            out["trend_side"] == 1,
+            out["ema200_slope_pct"] >= 0,
+            out["ema200_slope_pct"] <= 0,
+        )
+        slow_slope_filter = pd.Series(slow_slope_filter, index=out.index)
+    else:
+        slow_slope_filter = pd.Series(True, index=out.index)
+
+    out["base_signal"] = base_signal.fillna(False)
+    out["price_filter"] = price_filter.fillna(False)
+    out["fast_slope_filter"] = fast_slope_filter.fillna(False)
+    out["slow_slope_filter"] = slow_slope_filter.fillna(False)
+
+    out["research_signal"] = (
+        out["base_signal"]
+        & out["price_filter"]
+        & out["fast_slope_filter"]
+        & out["slow_slope_filter"]
+        & out["ema20"].notna()
+        & out["ema200"].notna()
+    ).fillna(False)
 
     return out
 
 
 # =============================================================================
-# SIGNAL ENGINE
+# BUCKET ENGINE (PINE PARITY)
 # =============================================================================
 
-def build_signal_mask(features: pd.DataFrame, cfg: CalibrationConfig) -> pd.Series:
-    mask = features["trend_side"] != 0
-    mask &= features["abs_e20_to_e200_pct"] >= cfg.min_abs_distance_pct
+def build_bucket_engine(features: pd.DataFrame, cfg: CalibrationConfig) -> pd.DataFrame:
+    out = features.copy()
 
-    if cfg.require_price_on_trend_side:
-        mask &= features["price_side_vs_ema20"] == features["trend_side"]
+    out["bucket_index"] = _bucket_index_from_abs_dist(
+        out["abs_e20_to_e200_pct"],
+        cfg.bucket_edges_pct,
+    )
+    out["bucket_text"] = _bucket_text_from_index(
+        out["bucket_index"],
+        cfg.bucket_edges_pct,
+    )
 
-    if cfg.require_fast_slope_confirmation:
-        mask &= np.where(
-            features["trend_side"] == 1,
-            features["ema20_slope_pct"] > 0,
-            features["ema20_slope_pct"] < 0,
-        )
+    return out
 
-    if cfg.require_slow_slope_confirmation:
-        mask &= np.where(
-            features["trend_side"] == 1,
-            features["ema200_slope_pct"] >= 0,
-            features["ema200_slope_pct"] <= 0,
-        )
 
-    mask &= features["distance_bucket"].notna()
-    mask &= features["ema20"].notna()
-    mask &= features["ema200"].notna()
+# =============================================================================
+# STAGE ENGINE (PINE PARITY)
+# =============================================================================
 
-    return mask.fillna(False)
+def build_stage_engine(features: pd.DataFrame, cfg: CalibrationConfig) -> pd.DataFrame:
+    out = features.copy()
+
+    out["stage"] = _stage_from_abs_dist(out["abs_e20_to_e200_pct"], cfg)
+    out["stage_text"] = _stage_text(out["stage"])
+
+    return out
+
+
+# =============================================================================
+# FEATURE FRAME (FULL PARITY BUILD)
+# =============================================================================
+
+def build_feature_frame(df: pd.DataFrame, cfg: CalibrationConfig) -> pd.DataFrame:
+    out = build_ema_core(df, cfg)
+    out = build_distance_engine(out, cfg)
+    out = build_signal_engine(out, cfg)
+    out = build_bucket_engine(out, cfg)
+    out = build_stage_engine(out, cfg)
+
+    out["trend_text"] = out["trend_side"].map(_direction_text)
+
+    return out
 
 
 # =============================================================================
@@ -270,14 +482,13 @@ def _forward_path_outcome(
         return "continuation", first_cont_idx + 1, mfe_price, mae_price
     if first_rev_idx is not None and first_cont_idx is None:
         return "reversal", first_rev_idx + 1, mfe_price, mae_price
-
     if first_cont_idx <= first_rev_idx:
         return "continuation", first_cont_idx + 1, mfe_price, mae_price
     return "reversal", first_rev_idx + 1, mfe_price, mae_price
 
 
 def run_forward_outcome_test(features: pd.DataFrame, cfg: CalibrationConfig) -> pd.DataFrame:
-    signal_mask = build_signal_mask(features, cfg)
+    signal_mask = features["research_signal"].fillna(False)
     signal_idx = np.flatnonzero(signal_mask.to_numpy())
 
     close = features[cfg.close_col].to_numpy(dtype=float)
@@ -321,11 +532,17 @@ def run_forward_outcome_test(features: pd.DataFrame, cfg: CalibrationConfig) -> 
             "mae_points": mae_price / cfg.point_value if pd.notna(mae_price) else np.nan,
             "ema20": float(features.iloc[i]["ema20"]),
             "ema200": float(features.iloc[i]["ema200"]),
-            "e20_to_e200_pct": float(features.iloc[i]["e20_to_e200_pct"]),
-            "abs_e20_to_e200_pct": float(features.iloc[i]["abs_e20_to_e200_pct"]),
+            "trend_side": int(features.iloc[i]["trend_side"]),
+            "price_side_vs_ema20": int(features.iloc[i]["price_side_vs_ema20"]),
             "ema20_slope_pct": float(features.iloc[i]["ema20_slope_pct"]),
             "ema200_slope_pct": float(features.iloc[i]["ema200_slope_pct"]),
-            "distance_bucket": features.iloc[i]["distance_bucket"],
+            "e20_to_e200_pct": float(features.iloc[i]["e20_to_e200_pct"]),
+            "abs_e20_to_e200_pct": float(features.iloc[i]["abs_e20_to_e200_pct"]),
+            "bucket_index": int(features.iloc[i]["bucket_index"]),
+            "bucket_text": str(features.iloc[i]["bucket_text"]),
+            "stage": int(features.iloc[i]["stage"]),
+            "stage_text": str(features.iloc[i]["stage_text"]),
+            "research_signal": bool(features.iloc[i]["research_signal"]),
         }
 
         if cfg.time_col and cfg.time_col in features.columns:
@@ -340,6 +557,7 @@ def run_forward_outcome_test(features: pd.DataFrame, cfg: CalibrationConfig) -> 
     events["is_continuation"] = events["outcome"].eq("continuation")
     events["is_reversal"] = events["outcome"].eq("reversal")
     events["is_unresolved"] = events["outcome"].eq("unresolved")
+
     return events
 
 
@@ -351,10 +569,7 @@ def summarize_by_bucket(events: pd.DataFrame, cfg: CalibrationConfig) -> pd.Data
     if events.empty:
         return pd.DataFrame()
 
-    def _first(x: pd.Series) -> Any:
-        return x.iloc[0] if len(x) else np.nan
-
-    grouped = events.groupby("distance_bucket", observed=True)
+    grouped = events.groupby(["bucket_index", "bucket_text"], observed=True)
 
     summary = grouped.agg(
         samples=("outcome", "size"),
@@ -374,14 +589,15 @@ def summarize_by_bucket(events: pd.DataFrame, cfg: CalibrationConfig) -> pd.Data
     summary["reversal_rate"] = summary["reversal_count"] / summary["samples"]
     summary["unresolved_rate"] = summary["unresolved_count"] / summary["samples"]
     summary["edge"] = summary["continuation_rate"] - summary["reversal_rate"]
+
     summary["cont_rev_ratio"] = np.where(
         summary["reversal_count"] > 0,
         summary["continuation_count"] / summary["reversal_count"],
         np.nan,
     )
 
-    summary["bucket_rank"] = np.arange(len(summary))
-    return summary.sort_values("bucket_rank").reset_index(drop=True)
+    summary = summary.sort_values("bucket_index").reset_index(drop=True)
+    return summary
 
 
 # =============================================================================
@@ -402,7 +618,10 @@ def classify_bucket_zone(row: pd.Series, cfg: CalibrationConfig) -> int:
     return 3
 
 
-def recommend_zones(bucket_summary: pd.DataFrame, cfg: CalibrationConfig) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def recommend_zones(
+    bucket_summary: pd.DataFrame,
+    cfg: CalibrationConfig,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     if bucket_summary.empty:
         return bucket_summary.copy(), {
             "zone_1": None,
@@ -413,23 +632,40 @@ def recommend_zones(bucket_summary: pd.DataFrame, cfg: CalibrationConfig) -> Tup
 
     out = bucket_summary.copy()
     out["zone"] = out.apply(lambda row: classify_bucket_zone(row, cfg), axis=1)
-    out["zone_name"] = out["zone"].map({0: "Insufficient", 1: "Zone 1", 2: "Zone 2", 3: "Zone 3"})
+    out["zone_name"] = out["zone"].map({
+        0: "Insufficient",
+        1: "Zone 1",
+        2: "Zone 2",
+        3: "Zone 3",
+    })
 
-    def _range_for_zone(zone_num: int) -> Optional[Dict[str, float]]:
-        sub = out.loc[out["zone"] == zone_num].sort_values("bucket_rank")
+    def _range_for_zone(zone_num: int) -> Optional[Dict[str, Any]]:
+        sub = out.loc[out["zone"] == zone_num].sort_values("bucket_index")
         if sub.empty:
             return None
-        valid_ranges = contiguous_ranges(sub["bucket_rank"].tolist())
+
+        valid_ranges = contiguous_ranges(sub["bucket_index"].tolist())
         largest = max(valid_ranges, key=lambda x: x[1] - x[0])
-        selected = out[(out["bucket_rank"] >= largest[0]) & (out["bucket_rank"] <= largest[1])]
+
+        selected = out[
+            (out["bucket_index"] >= largest[0]) &
+            (out["bucket_index"] <= largest[1])
+        ].sort_values("bucket_index")
+
         return {
-            "bucket_start": str(selected.iloc[0]["distance_bucket"]),
-            "bucket_end": str(selected.iloc[-1]["distance_bucket"]),
+            "bucket_start": str(selected.iloc[0]["bucket_text"]),
+            "bucket_end": str(selected.iloc[-1]["bucket_text"]),
+            "bucket_index_start": int(selected.iloc[0]["bucket_index"]),
+            "bucket_index_end": int(selected.iloc[-1]["bucket_index"]),
             "min_abs_distance_pct": float(selected["min_abs_distance_pct"].min()),
             "max_abs_distance_pct": float(selected["max_abs_distance_pct"].max()),
             "samples": int(selected["samples"].sum()),
-            "avg_continuation_rate": float(selected["continuation_count"].sum() / selected["samples"].sum()),
-            "avg_reversal_rate": float(selected["reversal_count"].sum() / selected["samples"].sum()),
+            "avg_continuation_rate": float(
+                selected["continuation_count"].sum() / selected["samples"].sum()
+            ),
+            "avg_reversal_rate": float(
+                selected["reversal_count"].sum() / selected["samples"].sum()
+            ),
         }
 
     recommendation = {
@@ -438,8 +674,13 @@ def recommend_zones(bucket_summary: pd.DataFrame, cfg: CalibrationConfig) -> Tup
         "zone_3": _range_for_zone(3),
         "note": (
             "Zones are derived from absolute EMA20-to-EMA200 percentage distance. "
-            "Use signed distance alongside trend side for directional context."
+            "Use signed distance together with trend side for directional context."
         ),
+        "pine_stage_thresholds": {
+            "zone1_max_pct": cfg.zone1_max_pct,
+            "zone2_max_pct": cfg.zone2_max_pct,
+            "zone3_min_pct": cfg.zone3_min_pct,
+        },
     }
 
     return out, recommendation
@@ -449,7 +690,10 @@ def recommend_zones(bucket_summary: pd.DataFrame, cfg: CalibrationConfig) -> Tup
 # PUBLIC RESEARCH API
 # =============================================================================
 
-def run_ema_distance_calibration(df: pd.DataFrame, cfg: Optional[CalibrationConfig] = None) -> Dict[str, Any]:
+def run_ema_distance_calibration(
+    df: pd.DataFrame,
+    cfg: Optional[CalibrationConfig] = None,
+) -> Dict[str, Any]:
     cfg = cfg or CalibrationConfig()
 
     features = build_feature_frame(df, cfg)
@@ -457,9 +701,8 @@ def run_ema_distance_calibration(df: pd.DataFrame, cfg: Optional[CalibrationConf
     bucket_summary = summarize_by_bucket(events, cfg)
     bucket_with_zones, recommendation = recommend_zones(bucket_summary, cfg)
 
-    headline: Dict[str, Any]
     if events.empty:
-        headline = {
+        headline: Dict[str, Any] = {
             "signals": 0,
             "continuation_rate": np.nan,
             "reversal_rate": np.nan,
@@ -473,9 +716,33 @@ def run_ema_distance_calibration(df: pd.DataFrame, cfg: Optional[CalibrationConf
             "unresolved_rate": float(events["is_unresolved"].mean()),
         }
 
+    latest: Dict[str, Any]
+    if features.empty:
+        latest = {}
+    else:
+        last = features.iloc[-1]
+        latest = {
+            "trend_side": int(last["trend_side"]) if pd.notna(last["trend_side"]) else 0,
+            "trend_text": str(last["trend_text"]),
+            "price_side_vs_ema20": int(last["price_side_vs_ema20"]) if pd.notna(last["price_side_vs_ema20"]) else 0,
+            "ema20_slope_pct": float(last["ema20_slope_pct"]) if pd.notna(last["ema20_slope_pct"]) else np.nan,
+            "ema200_slope_pct": float(last["ema200_slope_pct"]) if pd.notna(last["ema200_slope_pct"]) else np.nan,
+            "e20_to_e200_pct": float(last["e20_to_e200_pct"]) if pd.notna(last["e20_to_e200_pct"]) else np.nan,
+            "abs_e20_to_e200_pct": float(last["abs_e20_to_e200_pct"]) if pd.notna(last["abs_e20_to_e200_pct"]) else np.nan,
+            "bucket_index": int(last["bucket_index"]) if pd.notna(last["bucket_index"]) else 0,
+            "bucket_text": str(last["bucket_text"]),
+            "stage": int(last["stage"]) if pd.notna(last["stage"]) else 0,
+            "stage_text": str(last["stage_text"]),
+            "research_signal": bool(last["research_signal"]),
+        }
+
+        if cfg.time_col and cfg.time_col in features.columns:
+            latest[cfg.time_col] = last[cfg.time_col]
+
     return {
         "config": asdict(cfg),
         "headline": headline,
+        "latest": latest,
         "features": features,
         "events": events,
         "bucket_summary": bucket_summary,
@@ -491,6 +758,7 @@ def run_ema_distance_calibration(df: pd.DataFrame, cfg: Optional[CalibrationConf
 def format_recommendation_text(result: Dict[str, Any]) -> str:
     rec = result["recommendation"]
     headline = result["headline"]
+    latest = result.get("latest", {})
 
     lines: List[str] = []
     lines.append("EMA20–EMA200 Distance Calibration Report")
@@ -502,17 +770,29 @@ def format_recommendation_text(result: Dict[str, Any]) -> str:
         lines.append(f"Reversal rate:    {headline['reversal_rate']:.2%}")
         lines.append(f"Unresolved rate:  {headline['unresolved_rate']:.2%}")
 
-    lines.append("")
+    if latest:
+        lines.append("")
+        lines.append("Latest Bar Status")
+        lines.append("-" * 17)
+        lines.append(f"Trend:   {latest.get('trend_text', '-')}")
+        lines.append(f"Signal:  {'YES' if latest.get('research_signal', False) else 'NO'}")
+        lines.append(f"Signed %: {latest.get('e20_to_e200_pct', np.nan):.4f}")
+        lines.append(f"Abs %:    {latest.get('abs_e20_to_e200_pct', np.nan):.4f}")
+        lines.append(f"Bucket:   {latest.get('bucket_text', '-')}")
+        lines.append(f"Stage:    {latest.get('stage_text', '-')}")
 
+    lines.append("")
     for key, title in [("zone_1", "Zone 1"), ("zone_2", "Zone 2"), ("zone_3", "Zone 3")]:
         zone = rec.get(key)
         if not zone:
             lines.append(f"{title}: no robust range found")
             continue
+
         lines.append(
             f"{title}: {zone['bucket_start']} -> {zone['bucket_end']} "
-            f"(observed {zone['min_abs_distance_pct']:.3f}% to {zone['max_abs_distance_pct']:.3f}%, "
-            f"samples={zone['samples']}, cont={zone['avg_continuation_rate']:.2%}, rev={zone['avg_reversal_rate']:.2%})"
+            f"(observed {zone['min_abs_distance_pct']:.3f}% to "
+            f"{zone['max_abs_distance_pct']:.3f}%, samples={zone['samples']}, "
+            f"cont={zone['avg_continuation_rate']:.2%}, rev={zone['avg_reversal_rate']:.2%})"
         )
 
     lines.append("")
@@ -521,7 +801,7 @@ def format_recommendation_text(result: Dict[str, Any]) -> str:
 
 
 # =============================================================================
-# EXAMPLE USAGE
+# DEMO DATA
 # =============================================================================
 
 def _make_demo_data(rows: int = 5000, seed: int = 7) -> pd.DataFrame:
@@ -542,16 +822,19 @@ def _make_demo_data(rows: int = 5000, seed: int = 7) -> pd.DataFrame:
         "close": close,
     })
 
+
+# =============================================================================
+# EXAMPLE USAGE
+# =============================================================================
+
 if __name__ == "__main__":
-    import pandas as pd
     import glob
 
     files = glob.glob("data/*.csv")
-
     if not files:
         raise FileNotFoundError("No CSV files found in data/")
 
-    df_list = []
+    df_list: List[pd.DataFrame] = []
 
     for f in files:
         temp = pd.read_csv(
@@ -561,7 +844,6 @@ if __name__ == "__main__":
             names=["datetime", "open", "high", "low", "close", "volume"],
         )
 
-        # clean datetime like: "01.03.2024 00:00:00.000 UTC"
         temp["datetime"] = (
             temp["datetime"]
             .astype(str)
@@ -579,15 +861,13 @@ if __name__ == "__main__":
             temp[col] = pd.to_numeric(temp[col], errors="coerce")
 
         temp = temp.dropna(subset=["datetime", "open", "high", "low", "close"])
-
         df_list.append(temp)
 
     df = pd.concat(df_list, ignore_index=True)
-
     df = (
         df.sort_values("datetime")
-          .drop_duplicates(subset=["datetime"])
-          .reset_index(drop=True)
+        .drop_duplicates(subset=["datetime"])
+        .reset_index(drop=True)
     )
 
     print("Rows loaded:", len(df))
@@ -595,22 +875,24 @@ if __name__ == "__main__":
     print(df.tail())
 
     cfg = CalibrationConfig(
-    continuation_points=30,
-    reversal_points=30,
-    max_forward_bars=60,
-    point_value=0.01,
-    time_col="datetime",
-)
+        continuation_points=30,
+        reversal_points=30,
+        max_forward_bars=60,
+        point_value=0.01,
+        time_col="datetime",
+    )
 
     result = run_ema_distance_calibration(df, cfg)
 
     print(format_recommendation_text(result))
     print("\nBucket summary preview:\n")
+
     if not result["bucket_with_zones"].empty:
         print(
             result["bucket_with_zones"][
                 [
-                    "distance_bucket",
+                    "bucket_index",
+                    "bucket_text",
                     "samples",
                     "continuation_rate",
                     "reversal_rate",

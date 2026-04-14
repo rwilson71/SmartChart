@@ -15,7 +15,7 @@ from core.b_trend import build_trend
 from core.c_ema import build_ema
 from core.playbook.w_strategy_s1 import build_strategy_s1
 from core.playbook.w_strategy_s1_5 import build_strategy_s1_5
-
+from routers.cc_ema_distance_calibration_router import router as ema_distance_router
 
 # =============================================================================
 # CONFIG
@@ -42,7 +42,6 @@ _CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {
 
 _CACHE_LOCK = RLock()
 
-
 # =============================================================================
 # APP
 # =============================================================================
@@ -63,6 +62,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ✅ ADD THIS LINE
+app.include_router(ema_distance_router)
 
 
 # =============================================================================
