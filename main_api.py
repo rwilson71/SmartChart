@@ -28,7 +28,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DEFAULT_DATA_FILE = DATA_DIR / "xauusd.csv"
 
-# Small TTL for fast testing while still preventing repeated rebuilds
+# Keep short enough for testing, but long enough to reduce rebuild pressure
 CACHE_TTL_SECONDS = 120.0
 
 _CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {
@@ -55,8 +55,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later for production
-    allow_credentials=True,
+    allow_origins=[
+        "https://lbwtsmartchart.co.uk",
+        "https://www.lbwtsmartchart.co.uk",
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -418,36 +421,27 @@ def _website_ema_payload(df: pd.DataFrame) -> Dict[str, Any]:
         "indicator": "EMA",
         "price": _clean_value(latest.get("close")),
         "timestamp": _clean_value(latest.get("timestamp")),
-
         "direction": direction,
         "direction_color": direction_color,
-
         "local_dir": _clean_value(latest.get("sc_ema_local_dir")),
         "final_dir_score": _clean_value(latest.get("sc_ema_final_dir_score")),
-
         "behavior": behavior_map.get(behavior_type, "Neutral"),
         "behavior_type": behavior_type,
-
         "quality": quality_map.get(trend_quality, "Neutral"),
         "quality_state": trend_quality,
-
         "compression": _clean_value(latest.get("sc_ema_compression")),
         "fast_compression": _clean_value(latest.get("sc_ema_fast_compression")),
         "slow_compression": _clean_value(latest.get("sc_ema_slow_compression")),
         "slow_expansion": _clean_value(latest.get("sc_ema_slow_expansion")),
-
         "rt_any": _clean_value(latest.get("sc_ema_rt_any")),
         "rt_family": rt_family_map.get(rt_family, "None"),
         "rt_family_state": rt_family,
         "rt_dir": _clean_value(latest.get("ema_rt_dir")),
-
         "reclaim_20": _clean_value(latest.get("sc_ema_reclaim_20")),
         "reclaim_3350": _clean_value(latest.get("sc_ema_reclaim_3350")),
         "reclaim_100200": _clean_value(latest.get("sc_ema_reclaim_100200")),
-
         "price_to_ema20_pct": _clean_value(latest.get("sc_price_to_ema20_pct")),
         "ema20_to_ema200_pct": _clean_value(latest.get("sc_ema20_to_ema200_pct")),
-
         "mtf_avg_dir": _clean_value(latest.get("sc_ema_mtf_avg_dir")),
         "is_stretched_from20": _clean_value(latest.get("sc_is_stretched_from20")),
         "is_stretched_from200": _clean_value(latest.get("sc_is_stretched_from200")),
@@ -645,6 +639,7 @@ def trend_columns(filename: Optional[str] = Query(default=None)) -> Dict[str, An
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+
 @app.get("/website/trend/latest")
 def website_trend_latest(filename: Optional[str] = Query(default=None)) -> Dict[str, Any]:
     try:
@@ -653,7 +648,7 @@ def website_trend_latest(filename: Optional[str] = Query(default=None)) -> Dict[
 
         trend_dir_num = int(_clean_value(latest.get("trend_dir")) or 0)
         regime_text = str(_clean_value(latest.get("regime_label")) or "neutral").title()
-        quality_text = str(_clean_value(latest.get("trend_label")) or "Neutral").title()
+        quality_text = str(_clean_value(latest.get("trend_label")) or "neutral").title()
 
         if trend_dir_num > 0:
             direction = "Bullish"
@@ -689,6 +684,7 @@ def website_trend_latest(filename: Optional[str] = Query(default=None)) -> Dict[
 
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
 
 # =============================================================================
 # EMA ROUTES
@@ -843,6 +839,7 @@ def website_s15_latest(filename: Optional[str] = Query(default=None)) -> Dict[st
         return _website_payload("S1.5", s15)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
 
 @app.on_event("startup")
 def warm_cache() -> None:
