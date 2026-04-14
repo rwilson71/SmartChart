@@ -336,14 +336,22 @@ def _website_payload(strategy_name: str, df: pd.DataFrame) -> Dict[str, Any]:
         "timestamp": _clean_value(latest.get("timestamp")),
     }
 
-
 def _website_trend_payload(df: pd.DataFrame) -> Dict[str, Any]:
     latest = df.iloc[-1]
 
     trend_dir_num = int(_clean_value(latest.get("sc_trend_dir")) or 0)
+    trend_state = int(_clean_value(latest.get("sc_trend_state")) or 0)
+    trend_stage = int(_clean_value(latest.get("sc_trend_stage")) or 0)
+    regime_state = int(_clean_value(latest.get("sc_regime_state")) or 0)
+
     regime_text = str(_clean_value(latest.get("sc_regime_text")) or "Neutral")
     quality_text = str(_clean_value(latest.get("trend_quality_text")) or "Neutral")
-    stage = int(_clean_value(latest.get("sc_trend_stage")) or 0)
+
+    trend_strength = _clean_value(latest.get("sc_trend_strength"))
+    continuation_quality = _clean_value(latest.get("sc_continuation_quality"))
+    trend_decay = _clean_value(latest.get("sc_trend_decay"))
+
+    trend_weakening = trend_stage in (3, -3)
 
     if trend_dir_num > 0:
         direction = "Bullish"
@@ -355,18 +363,49 @@ def _website_trend_payload(df: pd.DataFrame) -> Dict[str, Any]:
         direction = "Neutral"
         direction_color = "gray"
 
+    if trend_state == 1 and not trend_weakening:
+        channel_state = "bull_strong_channel"
+        channel_label = "Bullish Control"
+        channel_color = "green"
+    elif trend_state == 1 and trend_weakening:
+        channel_state = "bull_weak_channel"
+        channel_label = "Bullish Weakening"
+        channel_color = "yellow"
+    elif trend_state == -1 and not trend_weakening:
+        channel_state = "bear_strong_channel"
+        channel_label = "Bearish Control"
+        channel_color = "red"
+    elif trend_state == -1 and trend_weakening:
+        channel_state = "bear_weak_channel"
+        channel_label = "Bearish Weakening"
+        channel_color = "orange"
+    elif regime_state == 2:
+        channel_state = "range_neutral_channel"
+        channel_label = "Range / Neutral"
+        channel_color = "gray"
+    else:
+        channel_state = "neutral_channel"
+        channel_label = "Neutral / Mixed"
+        channel_color = "gray"
+
     return {
         "status": "ok",
         "indicator": "Trend",
+        "debug_version": "trend_payload_v2",
         "price": _clean_value(latest.get("close")),
         "timestamp": _clean_value(latest.get("timestamp")),
         "direction": direction,
         "direction_color": direction_color,
-        "state": _clean_value(latest.get("sc_trend_state")),
-        "stage": stage,
-        "strength": _clean_value(latest.get("sc_trend_strength")),
-        "continuation_quality": _clean_value(latest.get("sc_continuation_quality")),
-        "decay": _clean_value(latest.get("sc_trend_decay")),
+        "channel_state": channel_state,
+        "channel_label": channel_label,
+        "channel_color": channel_color,
+        "state": trend_state,
+        "stage": trend_stage,
+        "strength": trend_strength,
+        "continuation_quality": continuation_quality,
+        "decay": trend_decay,
+        "trend_weakening": trend_weakening,
+        "regime_state": regime_state,
         "regime": regime_text,
         "quality": quality_text,
         "mtf_bias": _clean_value(latest.get("sc_mtf_bias")),
@@ -376,7 +415,6 @@ def _website_trend_payload(df: pd.DataFrame) -> Dict[str, Any]:
         "bull_weak_signal": _clean_value(latest.get("bull_weak_signal")),
         "bear_weak_signal": _clean_value(latest.get("bear_weak_signal")),
     }
-
 
 def _website_ema_payload(df: pd.DataFrame) -> Dict[str, Any]:
     latest = df.iloc[-1]
@@ -639,52 +677,13 @@ def trend_columns(filename: Optional[str] = Query(default=None)) -> Dict[str, An
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-
 @app.get("/website/trend/latest")
 def website_trend_latest(filename: Optional[str] = Query(default=None)) -> Dict[str, Any]:
     try:
-        truth = _build_truth_from_file(filename)
-        latest = truth.iloc[-1]
-
-        trend_dir_num = int(_clean_value(latest.get("trend_dir")) or 0)
-        regime_text = str(_clean_value(latest.get("regime_label")) or "neutral").title()
-        quality_text = str(_clean_value(latest.get("trend_label")) or "neutral").title()
-
-        if trend_dir_num > 0:
-            direction = "Bullish"
-            direction_color = "green"
-        elif trend_dir_num < 0:
-            direction = "Bearish"
-            direction_color = "red"
-        else:
-            direction = "Neutral"
-            direction_color = "gray"
-
-        return {
-            "status": "ok",
-            "indicator": "Trend",
-            "price": _clean_value(latest.get("close")),
-            "timestamp": _clean_value(latest.get("timestamp")),
-            "direction": direction,
-            "direction_color": direction_color,
-            "state": _clean_value(latest.get("trend_dir")),
-            "stage": None,
-            "strength": _clean_value(latest.get("trend_strength")),
-            "continuation_quality": _clean_value(latest.get("continuation_quality")),
-            "decay": None,
-            "regime": regime_text,
-            "quality": quality_text,
-            "mtf_bias": _clean_value(latest.get("bias_strength")),
-            "mtf_alignment": None,
-            "long_signal": None,
-            "short_signal": None,
-            "bull_weak_signal": None,
-            "bear_weak_signal": None,
-        }
-
+        trend_df = _build_trend_from_file(filename)
+        return _website_trend_payload(trend_df)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
 
 # =============================================================================
 # EMA ROUTES
