@@ -29,7 +29,7 @@ DATA_DIR = BASE_DIR / "data"
 DEFAULT_DATA_FILE = DATA_DIR / "xauusd.csv"
 
 # Small TTL for fast testing while still preventing repeated rebuilds
-CACHE_TTL_SECONDS = 10.0
+CACHE_TTL_SECONDS = 120.0
 
 _CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {
     "raw": {},
