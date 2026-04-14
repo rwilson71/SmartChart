@@ -1,0 +1,3 @@
+tv_column,python_column,diff_column,rows_compared,max_diff,mean_diff,median_diff
+AI-Weighted RSI,sc_ai_rsi_raw,raw_diff,392,0.9119165272174853,0.08602214636623844,0.049417558106064796
+AI-Weighted RSI Signal Line,sc_ai_rsi_signal,signal_diff,373,0.25014145731923687,0.047658296176754,0.028263715965510486

@@ -1,0 +1,3 @@
+,symbol,broker_symbol,broker_name,broker_mode,broker_enabled,timestamp,dir,dir_label,truth_ready,truth_strength,playbook_active,playbook_id,playbook_name,playbook_dir,playbook_label,side,s1_active,s1_long,s1_short,s15_active,s15_long,s15_short,forecast_permission,route_ready,order_type,qty,risk_pct,sl_price,tp_price,payload_ready,route_status
+0,XAUUSD,XAUUSD,broker_demo_1,demo,1,2026-04-07 19:40:00+00:00,1,bullish,0,0,0,0,NONE,0,neutral,flat,0,0,0,0,0,0,0,0,none,0.0,0.0,,,0,blocked
+1,XAUUSD,GOLD,broker_live_1,live,0,2026-04-07 19:40:00+00:00,1,bullish,0,0,0,0,NONE,0,neutral,flat,0,0,0,0,0,0,0,0,none,0.0,0.0,,,0,blocked
