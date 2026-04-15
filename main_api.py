@@ -17,7 +17,6 @@ from core.playbook.w_strategy_s1_5 import build_strategy_s1_5
 from routers.trend_api import router as trend_router
 from routers.ema_api import router as ema_router
 from routers.cc_ema_distance_router import router as ema_distance_router
-from routers.cc_ema_distance_router import research_router as ema_distance_research_router
 
 # =============================================================================
 # CONFIG
@@ -63,7 +62,6 @@ app.add_middleware(
 )
 
 app.include_router(ema_distance_router)
-app.include_router(ema_distance_research_router)
 app.include_router(trend_router)
 app.include_router(ema_router)
 # =============================================================================
