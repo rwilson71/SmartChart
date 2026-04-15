@@ -15,7 +15,8 @@ from core.b_trend import build_trend
 from core.c_ema import build_ema
 from core.playbook.w_strategy_s1 import build_strategy_s1
 from core.playbook.w_strategy_s1_5 import build_strategy_s1_5
-from routers.cc_ema_distance_calibration_router import router as ema_distance_router
+from routers.cc_ema_distance_router import router as ema_distance_router
+from routers.cc_ema_distance_router import research_router as ema_distance_research_router
 
 # =============================================================================
 # CONFIG
@@ -63,9 +64,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✅ ADD THIS LINE
 app.include_router(ema_distance_router)
-
+app.include_router(ema_distance_research_router)
 
 # =============================================================================
 # HELPERS
@@ -338,6 +338,7 @@ def _website_payload(strategy_name: str, df: pd.DataFrame) -> Dict[str, Any]:
         "timestamp": _clean_value(latest.get("timestamp")),
     }
 
+
 def _website_trend_payload(df: pd.DataFrame) -> Dict[str, Any]:
     latest = df.iloc[-1]
 
@@ -417,6 +418,7 @@ def _website_trend_payload(df: pd.DataFrame) -> Dict[str, Any]:
         "bull_weak_signal": _clean_value(latest.get("bull_weak_signal")),
         "bear_weak_signal": _clean_value(latest.get("bear_weak_signal")),
     }
+
 
 def _website_ema_payload(df: pd.DataFrame) -> Dict[str, Any]:
     latest = df.iloc[-1]
@@ -679,6 +681,7 @@ def trend_columns(filename: Optional[str] = Query(default=None)) -> Dict[str, An
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+
 @app.get("/website/trend/latest")
 def website_trend_latest(filename: Optional[str] = Query(default=None)) -> Dict[str, Any]:
     try:
@@ -686,6 +689,7 @@ def website_trend_latest(filename: Optional[str] = Query(default=None)) -> Dict[
         return _website_trend_payload(trend_df)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
 
 # =============================================================================
 # EMA ROUTES
