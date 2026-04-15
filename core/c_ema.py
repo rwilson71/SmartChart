@@ -38,6 +38,10 @@ DEFAULT_EMA_CONFIG: Dict[str, Any] = {
 }
 
 
+# ==============================================================================
+# HELPERS
+# ==============================================================================
+
 def _require_ohlc(df: pd.DataFrame) -> None:
     required = {"open", "high", "low", "close"}
     missing = required - set(df.columns)
@@ -140,6 +144,73 @@ def _mtf_dir_from_resample(df: pd.DataFrame, rule: str) -> pd.Series:
     return direction.reindex(df.index, method="ffill").fillna(0.0)
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(v):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if pd.isna(v):
+            return default
+        return int(v)
+    except Exception:
+        return default
+
+
+def _direction_label(v: int) -> str:
+    if v > 0:
+        return "Bullish"
+    if v < 0:
+        return "Bearish"
+    return "Neutral"
+
+
+def _behavior_label(v: int) -> str:
+    mapping = {
+        0: "Neutral",
+        1: "Compression",
+        2: "Expansion",
+        3: "Decay",
+    }
+    return mapping.get(int(v), "Neutral")
+
+
+def _quality_label(v: int) -> str:
+    mapping = {
+        0: "Neutral",
+        1: "Clean",
+        2: "Strong",
+    }
+    return mapping.get(int(v), "Neutral")
+
+
+def _rt_family_label(v: int) -> str:
+    mapping = {
+        0: "None",
+        1: "EMA 14-20",
+        2: "EMA 33-50",
+        3: "EMA 100-200",
+    }
+    return mapping.get(int(v), "None")
+
+
+def _direction_color(v: int) -> str:
+    if v > 0:
+        return "#22c55e"
+    if v < 0:
+        return "#ef4444"
+    return "#9ca3af"
+
+
+# ==============================================================================
+# MAIN ENGINE
+# ==============================================================================
+
 def build_ema(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
     _require_ohlc(df)
 
@@ -178,8 +249,8 @@ def build_ema(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> pd.D
     out["sc_price_to_ema200_pct"] = p_to_e200_pct
     out["sc_ema20_to_ema200_pct"] = e20_to_e200_pct
 
-    out["sc_is_stretched_from20"] = ((close - ema20).abs() / atr_dist) >= cfg["stretch20_atr"]
-    out["sc_is_stretched_from200"] = ((close - ema200).abs() / atr_dist) >= cfg["stretch200_atr"]
+    out["sc_is_stretched_from20"] = (((close - ema20).abs() / atr_dist) >= cfg["stretch20_atr"]).fillna(False)
+    out["sc_is_stretched_from200"] = (((close - ema200).abs() / atr_dist) >= cfg["stretch200_atr"]).fillna(False)
 
     slope_len = cfg["slope_len"]
     ema14_slope_pct = _safe_pct_diff(ema14, ema14.shift(slope_len))
@@ -555,9 +626,10 @@ def build_ema(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> pd.D
     out["sc_ema_trend_quality"] = ema_trend_quality
     out["sc_ema_compression"] = np.where(ema_compression, 1, 0)
     out["sc_ema_fast_compression"] = ema_fast_compression
+    out["sc_ema_fast_decay"] = ema_fast_decay
     out["sc_ema_slow_compression"] = ema_slow_compression
     out["sc_ema_slow_expansion"] = ema_slow_expansion
-    out["sc_ema_rt_any"] = sc_ema_rt_any
+    out["sc_ema_rt_any"] = sc_ema_rt_any.astype(int)
     out["sc_ema_rt_family"] = sc_ema_rt_family
     out["ema_rt_dir"] = ema_rt_dir
     out["sc_ema_reclaim_20"] = sc_ema_reclaim_20
@@ -566,3 +638,86 @@ def build_ema(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> pd.D
     out["sc_ema_mtf_avg_dir"] = mtf_avg_dir
 
     return out
+
+
+# ==============================================================================
+# WEBSITE / CACHE PAYLOAD BUILDER
+# ==============================================================================
+
+def build_ema_latest_payload(
+    df: pd.DataFrame,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    out = build_ema(df, config=config)
+
+    if out.empty:
+        return {
+            "debug_version": "ema_payload_v2",
+            "status": "empty",
+        }
+
+    last = out.iloc[-1]
+    ts = out.index[-1]
+
+    dir_value = _safe_int(last.get("sc_ema_final_dir", 0))
+    local_dir = _safe_int(last.get("sc_ema_local_dir", 0))
+    behavior_type = _safe_int(last.get("sc_ema_behavior_type", 0))
+    quality_state = _safe_int(last.get("sc_ema_trend_quality", 0))
+    rt_family_state = _safe_int(last.get("sc_ema_rt_family", 0))
+
+    payload: Dict[str, Any] = {
+        "debug_version": "ema_payload_v2",
+        "status": "ok",
+        "symbol": "XAUUSD",
+        "timestamp": str(ts),
+
+        "direction": _direction_label(dir_value),
+        "direction_value": dir_value,
+        "direction_color": _direction_color(dir_value),
+
+        "local_dir": local_dir,
+        "final_dir_score": round(_safe_float(last.get("sc_ema_final_dir_score", 0.0)), 4),
+
+        "behavior": _behavior_label(behavior_type),
+        "behavior_type": behavior_type,
+
+        "quality": _quality_label(quality_state),
+        "quality_state": quality_state,
+
+        "compression": _safe_int(last.get("sc_ema_compression", 0)),
+        "fast_compression": _safe_int(last.get("sc_ema_fast_compression", 0)),
+        "fast_decay": _safe_int(last.get("sc_ema_fast_decay", 0)),
+        "slow_compression": _safe_int(last.get("sc_ema_slow_compression", 0)),
+        "slow_expansion": _safe_int(last.get("sc_ema_slow_expansion", 0)),
+
+        "rt_any": _safe_int(last.get("sc_ema_rt_any", 0)),
+        "rt_family": _rt_family_label(rt_family_state),
+        "rt_family_state": rt_family_state,
+        "rt_dir": _safe_int(last.get("ema_rt_dir", 0)),
+
+        "reclaim_20": _safe_int(last.get("sc_ema_reclaim_20", 0)),
+        "reclaim_3350": _safe_int(last.get("sc_ema_reclaim_3350", 0)),
+        "reclaim_100200": _safe_int(last.get("sc_ema_reclaim_100200", 0)),
+
+        "price_to_ema20_pct": round(_safe_float(last.get("sc_price_to_ema20_pct", 0.0)), 4),
+        "price_to_ema200_pct": round(_safe_float(last.get("sc_price_to_ema200_pct", 0.0)), 4),
+        "ema20_to_ema200_pct": round(_safe_float(last.get("sc_ema20_to_ema200_pct", 0.0)), 4),
+
+        "mtf_avg_dir": round(_safe_float(last.get("sc_ema_mtf_avg_dir", 0.0)), 4),
+
+        "is_stretched_from20": _safe_int(last.get("sc_is_stretched_from20", 0)),
+        "is_stretched_from200": _safe_int(last.get("sc_is_stretched_from200", 0)),
+
+        "ema14": round(_safe_float(last.get("ema14", 0.0)), 4),
+        "ema20": round(_safe_float(last.get("ema20", 0.0)), 4),
+        "ema33": round(_safe_float(last.get("ema33", 0.0)), 4),
+        "ema50": round(_safe_float(last.get("ema50", 0.0)), 4),
+        "ema100": round(_safe_float(last.get("ema100", 0.0)), 4),
+        "ema200": round(_safe_float(last.get("ema200", 0.0)), 4),
+
+        "e20200_state": _safe_int(last.get("e20200_state", 0)),
+        "slow_anchor_bias": _safe_int(last.get("slow_anchor_bias", 0)),
+        "slow_anchor_state": _safe_int(last.get("slow_anchor_state", 0)),
+    }
+
+    return payload

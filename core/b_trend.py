@@ -79,8 +79,8 @@ DEFAULT_TREND_CONFIG: Dict[str, Any] = {
     # Score damping / cleanliness
     "score_path_weight": 0.70,
     "score_cluster_weight": 0.30,
-    "tight_price_ema20_pct": 0.08,   # percent
-    "tight_band_width_pct": 0.10,    # percent
+    "tight_price_ema20_pct": 0.08,
+    "tight_band_width_pct": 0.10,
     "tight_penalty": 0.20,
     "weak_slope_penalty": 0.12,
 }
@@ -205,9 +205,9 @@ def supertrend_line_dir(
     fac: float,
 ):
     atr_val = pd.to_numeric(
-    atr(high, low, close, atr_len),
-    errors="coerce",
-).fillna(0.0)
+        atr(high, low, close, atr_len),
+        errors="coerce",
+    ).fillna(0.0)
 
     ub0 = src + fac * atr_val
     lb0 = src - fac * atr_val
@@ -497,6 +497,144 @@ def _build_real_mtf_states(
     return result
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(v):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if pd.isna(v):
+            return default
+        return int(v)
+    except Exception:
+        return default
+
+
+def _state_label(state: int) -> str:
+    if state > 0:
+        return "Bullish"
+    if state < 0:
+        return "Bearish"
+    return "Neutral"
+
+
+def _stage_label(stage: int) -> str:
+    mapping = {
+        3: "Weakening Bull",
+        2: "Strong Bull",
+        1: "Bull",
+        0: "Neutral",
+        -1: "Bear",
+        -2: "Strong Bear",
+        -3: "Weakening Bear",
+    }
+    return mapping.get(int(stage), "Neutral")
+
+
+def _color_from_state(state: int) -> str:
+    if state > 0:
+        return "#22c55e"
+    if state < 0:
+        return "#ef4444"
+    return "#9ca3af"
+
+
+def build_trend_latest_payload(
+    df: pd.DataFrame,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    out = compute_trend_engine(df, config=config)
+
+    if out.empty:
+        return {
+            "debug_version": "trend_payload_v3",
+            "status": "empty",
+        }
+
+    last = out.iloc[-1]
+    ts = out.index[-1]
+
+    trend_state = _safe_int(last.get("sc_trend_state", 0))
+    trend_stage = _safe_int(last.get("sc_trend_stage", 0))
+    regime_text = str(last.get("sc_regime_text", "Neutral"))
+    quality_text = str(last.get("trend_quality_text", "Neutral"))
+
+    payload: Dict[str, Any] = {
+        "debug_version": "trend_payload_v3",
+        "status": "ok",
+        "symbol": "XAUUSD",
+        "timestamp": str(ts),
+
+        "direction": _state_label(trend_state),
+        "direction_value": trend_state,
+        "direction_color": _color_from_state(trend_state),
+
+        "channel_state": _state_label(trend_state),
+        "channel_label": _state_label(trend_state),
+        "channel_color": _color_from_state(trend_state),
+
+        "stage": trend_stage,
+        "stage_label": _stage_label(trend_stage),
+
+        "regime": regime_text,
+        "quality": quality_text,
+
+        "trend_strength": round(_safe_float(last.get("sc_trend_strength", 0.0)), 4),
+        "continuation_quality": round(_safe_float(last.get("sc_continuation_quality", 0.0)), 4),
+        "structure_quality": round(_safe_float(last.get("sc_structure_quality", 0.0)), 4),
+        "momentum_quality": round(_safe_float(last.get("sc_momentum_quality", 0.0)), 4),
+        "path_quality": round(_safe_float(last.get("sc_path_quality", 0.0)), 4),
+        "cluster_strength": round(_safe_float(last.get("sc_cluster_strength", 0.0)), 4),
+        "decay": round(_safe_float(last.get("sc_trend_decay", 0.0)), 4),
+
+        "trend_weakening": bool(_safe_int(last.get("sc_trend_stage", 0)) in (3, -3)),
+        "mtf_score": round(_safe_float(last.get("sc_mtf_score", 0.0)), 4),
+        "mtf_bias": _safe_int(last.get("sc_mtf_bias", 0)),
+        "mtf_alignment": _safe_int(last.get("sc_mtf_alignment", 0)),
+
+        "bull_score": round(_safe_float(last.get("bull_score", 0.0)), 4),
+        "bear_score": round(_safe_float(last.get("bear_score", 0.0)), 4),
+        "score_edge": round(_safe_float(last.get("score_edge", 0.0)), 4),
+        "cluster_bias": round(_safe_float(last.get("cluster_bias", 0.0)), 4),
+
+        "adx_value": round(_safe_float(last.get("adx_value", 0.0)), 4),
+        "atr_ratio": round(_safe_float(last.get("atr_ratio", 0.0)), 4),
+        "rsi": round(_safe_float(last.get("rsi", 0.0)), 4),
+        "mom": round(_safe_float(last.get("mom", 0.0)), 4),
+
+        "price_to_ema20_pct": round(_safe_float(last.get("price_to_ema20_pct", 0.0)), 4),
+        "e20e200_pct": round(_safe_float(last.get("e20e200_pct", 0.0)), 4),
+        "band_width_pct": round(_safe_float(last.get("band_width_pct", 0.0)), 4),
+
+        "ema20": round(_safe_float(last.get("ema20", 0.0)), 4),
+        "ema50": round(_safe_float(last.get("ema50", 0.0)), 4),
+        "ema200": round(_safe_float(last.get("ema200", 0.0)), 4),
+        "avt": round(_safe_float(last.get("avt", 0.0)), 4),
+
+        "trend_long_signal": _safe_int(last.get("trend_long_signal", 0)),
+        "trend_short_signal": _safe_int(last.get("trend_short_signal", 0)),
+        "bull_weak_signal": _safe_int(last.get("bull_weak_signal", 0)),
+        "bear_weak_signal": _safe_int(last.get("bear_weak_signal", 0)),
+
+        "mtf_states": {
+            "t1": _safe_int(last.get("mtf_trend_state_t1", 0)),
+            "t2": _safe_int(last.get("mtf_trend_state_t2", 0)),
+            "t3": _safe_int(last.get("mtf_trend_state_t3", 0)),
+            "t4": _safe_int(last.get("mtf_trend_state_t4", 0)),
+            "t5": _safe_int(last.get("mtf_trend_state_t5", 0)),
+            "t6": _safe_int(last.get("mtf_trend_state_t6", 0)),
+            "t7": _safe_int(last.get("mtf_trend_state_t7", 0)),
+        },
+    }
+
+    return payload
+
+
 # ==============================================================================
 # MAIN ENGINE
 # ==============================================================================
@@ -524,7 +662,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
 
     hlc3 = (high + low + close) / 3.0
 
-    # EMA structure
     ema14 = pd.to_numeric(ema(close, cfg["ema_fast1_len"]), errors="coerce").fillna(close)
     ema20 = pd.to_numeric(ema(close, cfg["ema_fast2_len"]), errors="coerce").fillna(close)
     ema33 = pd.to_numeric(ema(close, cfg["ema_mid1_len"]), errors="coerce").fillna(close)
@@ -539,10 +676,8 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
     price_to_ema20_pct = safe_div((close - ema20) * 100.0, ema20, default=0.0)
     band_width_pct = safe_div((band_hi - band_lo) * 100.0, close.abs().replace(0.0, np.nan), default=0.0)
 
-    # AVT adaptive base
     avt = kama_like(close, cfg["trend_len"])
 
-    # Cluster supertrend
     st1, d1 = supertrend_line_dir(hlc3, high, low, close, cfg["st_atr1"], cfg["st_fac1"])
     st2, d2 = supertrend_line_dir(hlc3, high, low, close, cfg["st_atr2"], cfg["st_fac2"])
     st3, d3 = supertrend_line_dir(hlc3, high, low, close, cfg["st_atr3"], cfg["st_fac3"])
@@ -570,7 +705,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
     bull_consensus = bull_w / w_sum if w_sum != 0 else pd.Series(0.0, index=idx, dtype=float)
     bear_consensus = bear_w / w_sum if w_sum != 0 else pd.Series(0.0, index=idx, dtype=float)
 
-    # Graded cluster, not binary
     trend_stack_score = (
         (ema20 > ema33).astype(float) * 0.22 +
         (ema33 > ema50).astype(float) * 0.18 +
@@ -621,7 +755,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
     cluster_bull_ok = cluster_bias >= float(cfg["cluster_thr"])
     cluster_bear_ok = cluster_bias <= -float(cfg["cluster_thr"])
 
-    # Momentum assist
     rsi_val = pd.to_numeric(rsi(close, cfg["rsi_len"]), errors="coerce").fillna(50.0)
     mom_raw = (close - close.shift(int(cfg["mom_len"]))).fillna(0.0)
     mom = pd.to_numeric(ema(mom_raw, cfg["mom_smooth"]), errors="coerce").fillna(0.0)
@@ -636,7 +769,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
         mom_assist_long = pd.Series(True, index=idx)
         mom_assist_short = pd.Series(True, index=idx)
 
-    # Regression / path quality
     reg_line_raw = linreg_series(close, cfg["reg_len"])
     reg_line = pd.to_numeric(ema(reg_line_raw.bfill().fillna(close), cfg["reg_smooth"]), errors="coerce").fillna(close)
 
@@ -645,9 +777,10 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
     regression_dir = pd.Series(np.where(reg_slope > 0, 1, np.where(reg_slope < 0, -1, 0)), index=idx, dtype=int)
 
     atr_trend = pd.to_numeric(
-    atr(high, low, close, cfg["atr_len"]),
-    errors="coerce",
+        atr(high, low, close, cfg["atr_len"]),
+        errors="coerce",
     ).fillna(0.0)
+
     reg_residual = (close - reg_line).fillna(0.0)
 
     reg_smoothness = 1.0 - np.minimum(
@@ -669,7 +802,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
 
     trend_path_quality = clamp_series((reg_corr * 0.6) + (reg_smoothness * 0.4), index=idx)
 
-    # Structural components
     dist_from_avt = close - avt
     avt_disp_score = clamp_series(
         safe_div(dist_from_avt.abs(), pd.Series(np.maximum(atr_trend, 1e-9), index=idx), default=0.0),
@@ -694,7 +826,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
     bull_path_agree = (regression_dir == 1) & (trend_path_quality >= 0.50)
     bear_path_agree = (regression_dir == -1) & (trend_path_quality >= 0.50)
 
-    # Graded score builder
     bull_base_score = (
         (bull_price_accept.astype(float) * 0.16) +
         (bull_struct_fast.astype(float) * 0.10) +
@@ -717,7 +848,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
         (mom_assist_short.astype(float) * 0.06)
     )
 
-    # Damping and cleanliness penalties
     path_cluster_bull_damper = (
         trend_path_quality * float(cfg["score_path_weight"]) +
         cluster_strength * float(cfg["score_cluster_weight"])
@@ -765,7 +895,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
 
     momentum_quality = clamp_series((mom_power * 0.6) + (rsi_strength * 0.4), index=idx)
 
-    # Trend state machine
     trend_state = _compute_trend_state_core(
         close=close,
         ema20=ema20,
@@ -779,7 +908,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
     )
     trend_dir = trend_state.copy()
 
-    # Stage / strength / continuation / decay
     base_strength = (
         (cluster_strength * 0.30) +
         (avt_disp_score * 0.20) +
@@ -878,7 +1006,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
     bull_weak_signal = ((trend_stage == 3) & (trend_stage.shift(1).fillna(0) != 3)).astype(int)
     bear_weak_signal = ((trend_stage == -3) & (trend_stage.shift(1).fillna(0) != -3)).astype(int)
 
-    # MTF blend
     if bool(cfg.get("use_real_mtf", True)):
         mtf = _build_real_mtf_states(calc_df, cfg)
     else:
@@ -906,17 +1033,16 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
     )
     mtf_alignment = (trend_state == mtf_bias).astype(int)
 
-    # Regime
     _, _, adx_value = compute_adx(calc_df, cfg["adx_len"])
 
     atr_short = pd.to_numeric(
-    atr(high, low, close, cfg["atr_short_len"]),
-    errors="coerce",
+        atr(high, low, close, cfg["atr_short_len"]),
+        errors="coerce",
     ).fillna(0.0)
 
     atr_long_raw = pd.to_numeric(
-    atr(high, low, close, cfg["atr_long_len"]),
-    errors="coerce",
+        atr(high, low, close, cfg["atr_long_len"]),
+        errors="coerce",
     ).fillna(0.0)
     atr_long = pd.to_numeric(ema(atr_long_raw, cfg["atr_long_len"]), errors="coerce").replace(0, np.nan)
     atr_ratio = safe_div(atr_short, atr_long, default=1.0)
@@ -991,7 +1117,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
     regime_exhaust_bull = regime_exhaustion & (trend_state == 1)
     regime_exhaust_bear = regime_exhaustion & (trend_state == -1)
 
-    # Output contract
     out["sc_trend_state"] = trend_state.astype(int)
     out["sc_trend_dir"] = trend_dir.astype(int)
     out["sc_trend_stage"] = trend_stage.astype(int)
@@ -1028,7 +1153,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
     out["bull_weak_signal"] = bull_weak_signal.astype(int)
     out["bear_weak_signal"] = bear_weak_signal.astype(int)
 
-    # Diagnostics
     out["ema14"] = ema14.astype(float)
     out["ema20"] = ema20.astype(float)
     out["ema33"] = ema33.astype(float)
@@ -1048,7 +1172,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
     out["atr_ratio"] = atr_ratio.astype(float)
     out["rsi"] = rsi_val.astype(float)
     out["mom"] = mom.astype(float)
-    out["sc_mtf_alignment"] = mtf_alignment.astype(int)
     out["reg_curvature"] = reg_curvature.astype(int)
     out["reg_curvature_raw"] = pd.to_numeric(reg_curvature_raw, errors="coerce").fillna(0.0).astype(float)
 
@@ -1061,7 +1184,6 @@ def compute_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = No
     for i in range(1, 8):
         out[f"mtf_trend_state_t{i}"] = mtf[f"t{i}"].astype(int)
 
-    # Truth bridge
     out["trend_dir"] = out["sc_trend_dir"].fillna(0).astype(int)
     out["trend_strength"] = out["sc_trend_strength"].fillna(0.0).astype(float)
     out["regime"] = out["sc_regime_state"].fillna(0).astype(int)
@@ -1085,43 +1207,3 @@ def build_trend(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> pd
 
 def run_trend_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
     return compute_trend_engine(df, config=config)
-
-
-if __name__ == "__main__":
-    n = 1000
-    x = np.arange(n, dtype=float)
-    base = 100 + x * 0.03 + np.sin(x / 12.0) * 1.2
-
-    idx = pd.date_range("2026-01-01 00:00:00", periods=n, freq="1min")
-
-    df = pd.DataFrame(
-        {
-            "open": base + np.sin(x / 17.0) * 0.15,
-            "high": base + 0.8,
-            "low": base - 0.8,
-            "close": base,
-        },
-        index=idx,
-    )
-
-    result = run_trend_engine(df)
-    print(
-        result[
-            [
-                "sc_trend_state",
-                "sc_trend_stage",
-                "bull_score",
-                "bear_score",
-                "score_edge",
-                "sc_path_quality",
-                "cluster_bias",
-                "sc_trend_strength",
-                "sc_continuation_quality",
-                "sc_trend_decay",
-                "sc_mtf_bias",
-                "sc_mtf_alignment",
-                "sc_regime_state",
-                "sc_regime_text",
-            ]
-        ].tail(10)
-    )

@@ -102,6 +102,7 @@ def validate_ohlc(df: pd.DataFrame, cfg: EmaDistanceConfig) -> None:
             f"Need at least {min_rows}, got {len(df)}."
         )
 
+
 def build_bucket_labels(edges: Sequence[float]) -> list[str]:
     labels: list[str] = []
     for i in range(len(edges) - 1):
@@ -152,6 +153,7 @@ def _bucket_index_from_abs_dist(abs_dist: pd.Series, edges: Sequence[float]) -> 
 def _bucket_text_from_index(bucket_index: pd.Series, edges: Sequence[float]) -> pd.Series:
     labels = build_bucket_labels(edges)
     mapping: Dict[int, str] = {
+        0: "NA",
         1: labels[0],
         2: labels[1],
         3: labels[2],
@@ -162,7 +164,6 @@ def _bucket_text_from_index(bucket_index: pd.Series, edges: Sequence[float]) -> 
         8: labels[7],
         9: labels[8],
         10: labels[9],
-        0: "NA",
     }
     return bucket_index.map(mapping).fillna("NA")
 
@@ -204,6 +205,44 @@ def _direction_text(v: int) -> str:
     return "NEUTRAL"
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if pd.isna(value):
+        return default
+    return int(value)
+
+
+def _safe_bool(value: Any) -> bool:
+    if pd.isna(value):
+        return False
+    return bool(value)
+
+
+def _extract_last_timestamp(
+    features: pd.DataFrame,
+    cfg: EmaDistanceConfig,
+) -> Optional[str]:
+    if cfg.time_col and cfg.time_col in features.columns:
+        value = features.iloc[-1][cfg.time_col]
+        if pd.notna(value):
+            ts = pd.to_datetime(value, errors="coerce")
+            if pd.notna(ts):
+                return ts.isoformat()
+            return str(value)
+
+    if isinstance(features.index, pd.DatetimeIndex) and len(features.index) > 0:
+        ts = features.index[-1]
+        if pd.notna(ts):
+            return ts.isoformat()
+
+    return None
+
+
 # =============================================================================
 # EMA CORE (PINE PARITY)
 # =============================================================================
@@ -234,6 +273,7 @@ def build_ema_core(df: pd.DataFrame, cfg: EmaDistanceConfig) -> pd.DataFrame:
 
     return out
 
+
 # =============================================================================
 # DISTANCE ENGINE (PINE PARITY)
 # =============================================================================
@@ -250,6 +290,7 @@ def build_distance_engine(features: pd.DataFrame, cfg: EmaDistanceConfig) -> pd.
     out["abs_e20_to_e200_pct"] = out["e20_to_e200_pct"].abs()
 
     return out
+
 
 # =============================================================================
 # SIGNAL FILTER ENGINE (PINE PARITY)
@@ -305,6 +346,7 @@ def build_signal_engine(features: pd.DataFrame, cfg: EmaDistanceConfig) -> pd.Da
 
     return out
 
+
 # =============================================================================
 # BUCKET ENGINE (PINE PARITY)
 # =============================================================================
@@ -323,6 +365,7 @@ def build_bucket_engine(features: pd.DataFrame, cfg: EmaDistanceConfig) -> pd.Da
 
     return out
 
+
 # =============================================================================
 # STAGE ENGINE (PINE PARITY)
 # =============================================================================
@@ -336,11 +379,15 @@ def build_stage_engine(features: pd.DataFrame, cfg: EmaDistanceConfig) -> pd.Dat
 
     return out
 
+
 # =============================================================================
 # FEATURE FRAME
 # =============================================================================
 
-def build_feature_frame(df: pd.DataFrame, cfg: Optional[EmaDistanceConfig] = None) -> pd.DataFrame:
+def build_feature_frame(
+    df: pd.DataFrame,
+    cfg: Optional[EmaDistanceConfig] = None,
+) -> pd.DataFrame:
     cfg = cfg or EmaDistanceConfig()
 
     out = build_ema_core(df, cfg)
@@ -372,30 +419,29 @@ def build_latest_payload(
         }
 
     last = features.iloc[-1]
+    timestamp = _extract_last_timestamp(features, cfg)
 
     payload: Dict[str, Any] = {
         "module": cfg.module_name,
         "debug_version": cfg.debug_version,
         "ready": True,
-        "trend_side": int(last["trend_side"]) if pd.notna(last["trend_side"]) else 0,
+        "timestamp": timestamp,
+        "trend_side": _safe_int(last["trend_side"]),
         "trend_text": str(last["trend_text"]),
-        "price_side_vs_ema20": int(last["price_side_vs_ema20"]) if pd.notna(last["price_side_vs_ema20"]) else 0,
-        "ema20": float(last["ema20"]) if pd.notna(last["ema20"]) else np.nan,
-        "ema200": float(last["ema200"]) if pd.notna(last["ema200"]) else np.nan,
-        "ema20_slope_pct": float(last["ema20_slope_pct"]) if pd.notna(last["ema20_slope_pct"]) else np.nan,
-        "ema200_slope_pct": float(last["ema200_slope_pct"]) if pd.notna(last["ema200_slope_pct"]) else np.nan,
-        "e20_to_e200_signed": float(last["e20_to_e200_signed"]) if pd.notna(last["e20_to_e200_signed"]) else np.nan,
-        "e20_to_e200_pct": float(last["e20_to_e200_pct"]) if pd.notna(last["e20_to_e200_pct"]) else np.nan,
-        "abs_e20_to_e200_pct": float(last["abs_e20_to_e200_pct"]) if pd.notna(last["abs_e20_to_e200_pct"]) else np.nan,
-        "bucket_index": int(last["bucket_index"]) if pd.notna(last["bucket_index"]) else 0,
+        "price_side_vs_ema20": _safe_int(last["price_side_vs_ema20"]),
+        "ema20": _safe_float(last["ema20"]),
+        "ema200": _safe_float(last["ema200"]),
+        "ema20_slope_pct": _safe_float(last["ema20_slope_pct"]),
+        "ema200_slope_pct": _safe_float(last["ema200_slope_pct"]),
+        "e20_to_e200_signed": _safe_float(last["e20_to_e200_signed"]),
+        "e20_to_e200_pct": _safe_float(last["e20_to_e200_pct"]),
+        "abs_e20_to_e200_pct": _safe_float(last["abs_e20_to_e200_pct"]),
+        "bucket_index": _safe_int(last["bucket_index"]),
         "bucket_text": str(last["bucket_text"]),
-        "stage": int(last["stage"]) if pd.notna(last["stage"]) else 0,
+        "stage": _safe_int(last["stage"]),
         "stage_text": str(last["stage_text"]),
-        "research_signal": bool(last["research_signal"]),
+        "research_signal": _safe_bool(last["research_signal"]),
     }
-
-    if cfg.time_col and cfg.time_col in features.columns:
-        payload[cfg.time_col] = features.iloc[-1][cfg.time_col]
 
     return payload
 
