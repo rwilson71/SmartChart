@@ -24,7 +24,7 @@ DEFAULT_CFG = CalibrationConfig(
 )
 
 
-DATA_FILE = "data/xauusd.csv"
+DATA_FILE = "data/xauusd_m1_full.csv"
 
 
 # =============================================================================
@@ -41,10 +41,16 @@ def load_data() -> pd.DataFrame:
         df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
 
     for col in ["open", "high", "low", "close"]:
+        if col not in df.columns:
+            raise HTTPException(status_code=500, detail=f"Missing required column: {col}")
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna(subset=["open", "high", "low", "close"])
-    df = df.sort_values("datetime").reset_index(drop=True)
+
+    if "datetime" in df.columns:
+        df = df.sort_values("datetime").reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
 
     return df
 
