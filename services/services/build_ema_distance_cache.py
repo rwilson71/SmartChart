@@ -13,6 +13,7 @@ from core.cc_ema_distance_calibration import (
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_PATH = BASE_DIR / "data" / "xauusd.csv"
+
 CACHE_TTL_SECONDS = 10.0
 
 _CACHE: Dict[str, Dict[str, Any]] = {
