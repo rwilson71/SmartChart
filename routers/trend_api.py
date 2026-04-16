@@ -23,10 +23,9 @@ def get_trend_latest():
                 status_code=500,
                 detail=f"Failed to read trend cache: {e}"
             )
-
     # Fallback to live build
     try:
-        df = load_price_data()
+        df = load_price_data().tail(2000).copy()
         return build_trend_latest_payload(df)
     except Exception as e:
         raise HTTPException(
