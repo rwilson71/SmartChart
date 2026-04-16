@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
-
 
 # =============================================================================
 # CONFIG
@@ -624,5 +623,235 @@ if __name__ == "__main__":
         "pb_strength",
     ]
 
-    print("SmartChart Pullback / Retest Engine — direct test")
-    print(result[cols].tail(30))
+    # =============================================================================
+# PAYLOAD BUILDER
+# =============================================================================
+
+DEFAULT_PULLBACK_RETEST_CONFIG: Dict[str, Any] = asdict(PullbackRetestConfig())
+
+
+def _to_native(value: Any) -> Any:
+    if pd.isna(value):
+        return None
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    return value
+
+
+def build_pullback_retest_latest_payload(
+    df: pd.DataFrame,
+    config: Optional[Dict[str, Any]] = None,
+    confluence_df: Optional[pd.DataFrame] = None,
+    trend_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
+    """
+    Build website/API payload for the latest Pullback / Retest state.
+    """
+    cfg_dict = DEFAULT_PULLBACK_RETEST_CONFIG.copy()
+    if config:
+        cfg_dict.update(config)
+
+    cfg = PullbackRetestConfig(**cfg_dict)
+
+    result = calculate_pullback_retest(
+        df=df,
+        config=cfg,
+        confluence_df=confluence_df,
+        trend_df=trend_df,
+    )
+
+    if result.empty:
+        return {}
+
+    last_idx = result.index[-1]
+    last = result.iloc[-1]
+
+    direction = int(_to_native(last.get("pb_direction", 0)) or 0)
+    signal = int(_to_native(last.get("pb_signal", 0)) or 0)
+    strength = float(_to_native(last.get("pb_strength", 0.0)) or 0.0)
+
+    if direction > 0:
+        direction_label = "bullish"
+    elif direction < 0:
+        direction_label = "bearish"
+    else:
+        direction_label = "neutral"
+
+    active_groups = []
+    if int(_to_native(last.get("rt_any_ema_export", 0)) or 0) == 1:
+        active_groups.append("ema")
+    if int(_to_native(last.get("rt_any_structure_export", 0)) or 0) == 1:
+        active_groups.append("structure")
+    if int(_to_native(last.get("rt_any_fib_export", 0)) or 0) == 1:
+        active_groups.append("fib")
+    if int(_to_native(last.get("rt_any_cloud_export", 0)) or 0) == 1:
+        active_groups.append("cloud")
+
+    if signal == 1 and strength >= 0.75:
+        state_label = "strong_retest"
+    elif signal == 1 and strength >= 0.50:
+        state_label = "active_retest"
+    elif signal == 1:
+        state_label = "weak_retest"
+    else:
+        state_label = "no_retest"
+
+    payload = {
+        "indicator": "pullback_retest",
+        "timestamp": last_idx.isoformat(),
+        "state": {
+            "direction": direction,
+            "direction_label": direction_label,
+            "signal": signal,
+            "strength": round(strength, 4),
+            "state_label": state_label,
+            "active_groups": active_groups,
+        },
+        "levels": {
+            "ema14": _to_native(last.get("ema14")),
+            "ema20": _to_native(last.get("ema20")),
+            "ema33": _to_native(last.get("ema33")),
+            "ema50": _to_native(last.get("ema50")),
+            "ema100": _to_native(last.get("ema100")),
+            "ema200": _to_native(last.get("ema200")),
+            "session_high": _to_native(last.get("session_high")),
+            "session_low": _to_native(last.get("session_low")),
+            "prev_day_high": _to_native(last.get("prev_day_high")),
+            "prev_day_low": _to_native(last.get("prev_day_low")),
+            "first_5m_high": _to_native(last.get("first_5m_high")),
+            "first_5m_low": _to_native(last.get("first_5m_low")),
+            "first_15m_high": _to_native(last.get("first_15m_high")),
+            "first_15m_low": _to_native(last.get("first_15m_low")),
+            "conf_cloud_lo": _to_native(last.get("conf_cloud_lo")),
+            "conf_cloud_hi": _to_native(last.get("conf_cloud_hi")),
+            "conf_cloud_mid": _to_native(last.get("conf_cloud_mid")),
+            "fib25": _to_native(last.get("fib25")),
+            "fib33": _to_native(last.get("fib33")),
+            "fib50": _to_native(last.get("fib50")),
+            "fib615": _to_native(last.get("fib615")),
+            "fib66": _to_native(last.get("fib66")),
+            "fib78": _to_native(last.get("fib78")),
+            "atr_now": _to_native(last.get("atr_now")),
+            "retest_tolerance": _to_native(last.get("retest_tolerance")),
+        },
+        "retests": {
+            "ema": {
+                "ema1420": {
+                    "active": int(_to_native(last.get("rt_ema1420_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_ema1420_ttl", 0)) or 0),
+                },
+                "ema3350": {
+                    "active": int(_to_native(last.get("rt_ema3350_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_ema3350_ttl", 0)) or 0),
+                },
+                "ema100200": {
+                    "active": int(_to_native(last.get("rt_ema100200_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_ema100200_ttl", 0)) or 0),
+                },
+                "any": int(_to_native(last.get("rt_any_ema_export", 0)) or 0),
+            },
+            "structure": {
+                "session_high": {
+                    "active": int(_to_native(last.get("rt_session_high_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_session_high_ttl", 0)) or 0),
+                },
+                "session_low": {
+                    "active": int(_to_native(last.get("rt_session_low_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_session_low_ttl", 0)) or 0),
+                },
+                "prev_day_high": {
+                    "active": int(_to_native(last.get("rt_prev_day_high_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_prev_day_high_ttl", 0)) or 0),
+                },
+                "prev_day_low": {
+                    "active": int(_to_native(last.get("rt_prev_day_low_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_prev_day_low_ttl", 0)) or 0),
+                },
+                "first_5m_high": {
+                    "active": int(_to_native(last.get("rt_first_5m_high_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_first_5m_high_ttl", 0)) or 0),
+                },
+                "first_5m_low": {
+                    "active": int(_to_native(last.get("rt_first_5m_low_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_first_5m_low_ttl", 0)) or 0),
+                },
+                "first_15m_high": {
+                    "active": int(_to_native(last.get("rt_first_15m_high_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_first_15m_high_ttl", 0)) or 0),
+                },
+                "first_15m_low": {
+                    "active": int(_to_native(last.get("rt_first_15m_low_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_first_15m_low_ttl", 0)) or 0),
+                },
+                "any": int(_to_native(last.get("rt_any_structure_export", 0)) or 0),
+            },
+            "fib": {
+                "fib25": {
+                    "active": int(_to_native(last.get("rt_fib25_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_fib25_ttl", 0)) or 0),
+                },
+                "fib33": {
+                    "active": int(_to_native(last.get("rt_fib33_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_fib33_ttl", 0)) or 0),
+                },
+                "fib50": {
+                    "active": int(_to_native(last.get("rt_fib50_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_fib50_ttl", 0)) or 0),
+                },
+                "fib615": {
+                    "active": int(_to_native(last.get("rt_fib615_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_fib615_ttl", 0)) or 0),
+                },
+                "fib66": {
+                    "active": int(_to_native(last.get("rt_fib66_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_fib66_ttl", 0)) or 0),
+                },
+                "fib78": {
+                    "active": int(_to_native(last.get("rt_fib78_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_fib78_ttl", 0)) or 0),
+                },
+                "any": int(_to_native(last.get("rt_any_fib_export", 0)) or 0),
+            },
+            "cloud": {
+                "active": int(_to_native(last.get("rt_conf_cloud_active_export", 0)) or 0),
+                "ttl": int(_to_native(last.get("rt_conf_cloud_ttl", 0)) or 0),
+                "any": int(_to_native(last.get("rt_any_cloud_export", 0)) or 0),
+            },
+            "any": int(_to_native(last.get("rt_any_export", 0)) or 0),
+        },
+        "exports": {
+            "pb_direction": direction,
+            "pb_signal": signal,
+            "pb_strength": round(strength, 4),
+            "rt_ema1420_active_export": int(_to_native(last.get("rt_ema1420_active_export", 0)) or 0),
+            "rt_ema3350_active_export": int(_to_native(last.get("rt_ema3350_active_export", 0)) or 0),
+            "rt_ema100200_active_export": int(_to_native(last.get("rt_ema100200_active_export", 0)) or 0),
+            "rt_conf_cloud_active_export": int(_to_native(last.get("rt_conf_cloud_active_export", 0)) or 0),
+            "rt_session_high_active_export": int(_to_native(last.get("rt_session_high_active_export", 0)) or 0),
+            "rt_session_low_active_export": int(_to_native(last.get("rt_session_low_active_export", 0)) or 0),
+            "rt_prev_day_high_active_export": int(_to_native(last.get("rt_prev_day_high_active_export", 0)) or 0),
+            "rt_prev_day_low_active_export": int(_to_native(last.get("rt_prev_day_low_active_export", 0)) or 0),
+            "rt_first_5m_high_active_export": int(_to_native(last.get("rt_first_5m_high_active_export", 0)) or 0),
+            "rt_first_5m_low_active_export": int(_to_native(last.get("rt_first_5m_low_active_export", 0)) or 0),
+            "rt_first_15m_high_active_export": int(_to_native(last.get("rt_first_15m_high_active_export", 0)) or 0),
+            "rt_first_15m_low_active_export": int(_to_native(last.get("rt_first_15m_low_active_export", 0)) or 0),
+            "rt_fib25_active_export": int(_to_native(last.get("rt_fib25_active_export", 0)) or 0),
+            "rt_fib33_active_export": int(_to_native(last.get("rt_fib33_active_export", 0)) or 0),
+            "rt_fib50_active_export": int(_to_native(last.get("rt_fib50_active_export", 0)) or 0),
+            "rt_fib615_active_export": int(_to_native(last.get("rt_fib615_active_export", 0)) or 0),
+            "rt_fib66_active_export": int(_to_native(last.get("rt_fib66_active_export", 0)) or 0),
+            "rt_fib78_active_export": int(_to_native(last.get("rt_fib78_active_export", 0)) or 0),
+            "rt_any_ema_export": int(_to_native(last.get("rt_any_ema_export", 0)) or 0),
+            "rt_any_structure_export": int(_to_native(last.get("rt_any_structure_export", 0)) or 0),
+            "rt_any_fib_export": int(_to_native(last.get("rt_any_fib_export", 0)) or 0),
+            "rt_any_cloud_export": int(_to_native(last.get("rt_any_cloud_export", 0)) or 0),
+            "rt_any_export": int(_to_native(last.get("rt_any_export", 0)) or 0),
+        },
+        "config": cfg_dict,
+    }
+
+    return payload

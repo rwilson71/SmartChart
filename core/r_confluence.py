@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from core.a_indicators import ema, atr, rsi
+from core.a_indicators import ema, atr
 
 
 DEFAULT_R_CONFLUENCE_CONFIG: Dict[str, Any] = {
@@ -170,20 +170,24 @@ def _map_htf_state(df: pd.DataFrame, rule: str, ema_fast_len: int, ema_slow_len:
     htf = _resample_ohlcv(df, rule)
     htf_fast = ema(htf["close"], ema_fast_len)
     htf_slow = ema(htf["close"], ema_slow_len)
+
     state = pd.Series(0.0, index=htf.index)
     bull = (htf["close"] > htf_fast) & (htf_fast > htf_slow)
     bear = (htf["close"] < htf_fast) & (htf_fast < htf_slow)
     state.loc[bull] = 1.0
     state.loc[bear] = -1.0
+
     return state.reindex(df.index, method="ffill").fillna(0.0)
 
 
 def _infer_freq_rule(index: pd.DatetimeIndex) -> str:
     if len(index) < 3:
         return "1min"
+
     diffs = pd.Series(index[1:] - index[:-1]).dropna()
     if diffs.empty:
         return "1min"
+
     med = diffs.median()
     mins = max(int(round(med.total_seconds() / 60.0)), 1)
     return f"{mins}min"
@@ -210,6 +214,7 @@ def _compute_volume_profile_window(
     highest = float(np.nanmax(high_arr))
     lowest = float(np.nanmin(low_arr))
     step = (highest - lowest) / max(bins - 1, 1)
+
     if not np.isfinite(step) or step <= 0:
         return (np.nan, np.nan, np.nan, 0.5, 0.5, highest, lowest, np.nan, 0.0, 0, 0, 0, 0.0)
 
@@ -220,9 +225,9 @@ def _compute_volume_profile_window(
     for i in range(len(high_arr)):
         is_bull = close_arr[i] >= open_arr[i]
         include = (
-            True if volume_type == "Both" else
-            is_bull if volume_type == "Bullish" else
-            (not is_bull)
+            True if volume_type == "Both"
+            else is_bull if volume_type == "Bullish"
+            else (not is_bull)
         )
         if not include:
             continue
@@ -269,7 +274,22 @@ def _compute_volume_profile_window(
 
     vah = lowest + step * va_up
     val = lowest + step * va_dn
-    return (poc, vah, val, bull_share, bear_share, highest, lowest, step, poc_vol, poc_idx, va_dn, va_up, total_vol)
+
+    return (
+        poc,
+        vah,
+        val,
+        bull_share,
+        bear_share,
+        highest,
+        lowest,
+        step,
+        poc_vol,
+        poc_idx,
+        va_dn,
+        va_up,
+        total_vol,
+    )
 
 
 def _compute_volume_profile_series(
@@ -302,13 +322,72 @@ def _compute_volume_profile_series(
     c = df["close"].to_numpy(dtype=float)
     v = df["volume"].to_numpy(dtype=float)
 
+    keys = list(cols.keys())
+
     for i in range(lookback - 1, n):
         s = slice(i - lookback + 1, i + 1)
-        vals = _compute_volume_profile_window(h[s], l[s], o[s], c[s], v[s], volume_type, bins, va_percent)
-        for k, key in enumerate(cols.keys()):
+        vals = _compute_volume_profile_window(
+            h[s], l[s], o[s], c[s], v[s], volume_type, bins, va_percent
+        )
+        for k, key in enumerate(keys):
             cols[key][i] = vals[k]
 
     return pd.DataFrame(cols, index=df.index)
+
+
+def _dir_label(v: float | int | None) -> str:
+    if v == 1:
+        return "bull"
+    if v == -1:
+        return "bear"
+    return "neutral"
+
+
+def _strength_label(v: float | int | None) -> str:
+    if v == 3:
+        return "A+"
+    if v == 2:
+        return "B"
+    if v == 1:
+        return "C"
+    return "N"
+
+
+def _safe_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _safe_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def _safe_bool(v: Any) -> bool:
+    try:
+        if pd.isna(v):
+            return False
+    except Exception:
+        pass
+    return bool(v)
 
 
 # =============================================================================
@@ -351,8 +430,14 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
 
     w = cfg["mtf_weights"]
     wsum = max(float(sum(w)), 1e-4)
-    out["mtf_raw"] = out["mtf_s1"] * w[0] + out["mtf_s2"] * w[1] + out["mtf_s3"] * w[2] + out["mtf_s4"] * w[3]
+    out["mtf_raw"] = (
+        out["mtf_s1"] * w[0]
+        + out["mtf_s2"] * w[1]
+        + out["mtf_s3"] * w[2]
+        + out["mtf_s4"] * w[3]
+    )
     out["mtf_avg"] = out["mtf_raw"] / wsum
+
     out["mtf_dir"] = 0
     out.loc[out["mtf_avg"] >= float(cfg["mtf_bias_bull_min"]), "mtf_dir"] = 1
     out.loc[out["mtf_avg"] <= float(cfg["mtf_bias_bear_max"]), "mtf_dir"] = -1
@@ -361,10 +446,8 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
     # 2) Macro location
     # -------------------------------------------------------------------------
     daily = _resample_ohlcv(out, "1D")
-    prev_day_high = daily["high"].shift(1).reindex(out.index, method="ffill")
-    prev_day_low = daily["low"].shift(1).reindex(out.index, method="ffill")
-    out["prev_day_high"] = prev_day_high
-    out["prev_day_low"] = prev_day_low
+    out["prev_day_high"] = daily["high"].shift(1).reindex(out.index, method="ffill")
+    out["prev_day_low"] = daily["low"].shift(1).reindex(out.index, method="ffill")
 
     piv = int(cfg["fib_pivot_len"])
     out["ph"] = _pivot_high(out["high"], piv, piv)
@@ -372,15 +455,31 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
     out["last_pivot_high"] = out["ph"].ffill()
     out["last_pivot_low"] = out["pl"].ffill()
 
-    out["bull_fib_ready"] = out["prev_day_low"].notna() & out["last_pivot_high"].notna() & (out["last_pivot_high"] > out["prev_day_low"])
-    out["bear_fib_ready"] = out["prev_day_high"].notna() & out["last_pivot_low"].notna() & (out["last_pivot_low"] < out["prev_day_high"])
+    out["bull_fib_ready"] = (
+        out["prev_day_low"].notna()
+        & out["last_pivot_high"].notna()
+        & (out["last_pivot_high"] > out["prev_day_low"])
+    )
+    out["bear_fib_ready"] = (
+        out["prev_day_high"].notna()
+        & out["last_pivot_low"].notna()
+        & (out["last_pivot_low"] < out["prev_day_high"])
+    )
 
     out["macro_dir"] = 0
     out.loc[(out["mtf_dir"] == 1) & out["bull_fib_ready"], "macro_dir"] = 1
     out.loc[(out["mtf_dir"] == -1) & out["bear_fib_ready"], "macro_dir"] = -1
 
-    out["fib_a"] = np.where(out["macro_dir"] == 1, out["prev_day_low"], np.where(out["macro_dir"] == -1, out["prev_day_high"], np.nan))
-    out["fib_b"] = np.where(out["macro_dir"] == 1, out["last_pivot_high"], np.where(out["macro_dir"] == -1, out["last_pivot_low"], np.nan))
+    out["fib_a"] = np.where(
+        out["macro_dir"] == 1,
+        out["prev_day_low"],
+        np.where(out["macro_dir"] == -1, out["prev_day_high"], np.nan),
+    )
+    out["fib_b"] = np.where(
+        out["macro_dir"] == 1,
+        out["last_pivot_high"],
+        np.where(out["macro_dir"] == -1, out["last_pivot_low"], np.nan),
+    )
     out["fib_range"] = np.where(out["macro_dir"] != 0, np.abs(out["fib_b"] - out["fib_a"]), np.nan)
 
     mode = str(cfg["macro_fib_mode"])
@@ -397,19 +496,42 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
         out["macro_l1"] = _fib_level(out["macro_dir"], out["fib_a"], out["fib_range"], 0.66)
         out["macro_l2"] = _fib_level(out["macro_dir"], out["fib_a"], out["fib_range"], 0.78)
 
-    out["raw_macro_lo"] = np.where((out["macro_dir"] != 0) & out["macro_l1"].notna() & out["macro_l2"].notna(), np.minimum(out["macro_l1"], out["macro_l2"]), np.nan)
-    out["raw_macro_hi"] = np.where((out["macro_dir"] != 0) & out["macro_l1"].notna() & out["macro_l2"].notna(), np.maximum(out["macro_l1"], out["macro_l2"]), np.nan)
+    out["raw_macro_lo"] = np.where(
+        (out["macro_dir"] != 0) & out["macro_l1"].notna() & out["macro_l2"].notna(),
+        np.minimum(out["macro_l1"], out["macro_l2"]),
+        np.nan,
+    )
+    out["raw_macro_hi"] = np.where(
+        (out["macro_dir"] != 0) & out["macro_l1"].notna() & out["macro_l2"].notna(),
+        np.maximum(out["macro_l1"], out["macro_l2"]),
+        np.nan,
+    )
+
     out["macro_pad"] = (out["raw_macro_hi"] - out["raw_macro_lo"]) * float(cfg["macro_pad_pct"])
     out["base_macro_lo"] = out["raw_macro_lo"] - out["macro_pad"]
     out["base_macro_hi"] = out["raw_macro_hi"] + out["macro_pad"]
     out["base_macro_size"] = (out["base_macro_hi"] - out["base_macro_lo"]).abs()
     out["macro_floor"] = out["atr_now"] * float(cfg["macro_atr_mult"])
-    out["final_macro_size"] = np.maximum(out["base_macro_size"], np.maximum(out["macro_floor"], float(cfg["macro_min_abs"])))
-    out["macro_extra_half"] = np.maximum(0.0, (out["final_macro_size"] - out["base_macro_size"]) * 0.5)
+    out["final_macro_size"] = np.maximum(
+        out["base_macro_size"],
+        np.maximum(out["macro_floor"], float(cfg["macro_min_abs"])),
+    )
+    out["macro_extra_half"] = np.maximum(
+        0.0,
+        (out["final_macro_size"] - out["base_macro_size"]) * 0.5,
+    )
     out["macro_zone_lo"] = out["base_macro_lo"] - out["macro_extra_half"]
     out["macro_zone_hi"] = out["base_macro_hi"] + out["macro_extra_half"]
-    out["macro_zone_ready"] = (out["macro_dir"] != 0) & out["macro_zone_lo"].notna() & out["macro_zone_hi"].notna()
-    out["in_macro_zone"] = out["macro_zone_ready"] & (out["close"] >= out["macro_zone_lo"]) & (out["close"] <= out["macro_zone_hi"])
+    out["macro_zone_ready"] = (
+        (out["macro_dir"] != 0)
+        & out["macro_zone_lo"].notna()
+        & out["macro_zone_hi"].notna()
+    )
+    out["in_macro_zone"] = (
+        out["macro_zone_ready"]
+        & (out["close"] >= out["macro_zone_lo"])
+        & (out["close"] <= out["macro_zone_hi"])
+    )
 
     # -------------------------------------------------------------------------
     # 3) Smart-money activity layers
@@ -427,23 +549,45 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
     out["density_bot"] = out["close"] - out["atr_now"] * float(cfg["den_depth_atr"])
     out["density_bull"] = out["density_event"] & (out["delta_sm"] >= 0)
     out["density_bear"] = out["density_event"] & (out["delta_sm"] < 0)
+
     out["density_dir"] = 0
     out.loc[(out["macro_dir"] == 1) & out["density_bull"], "density_dir"] = 1
     out.loc[(out["macro_dir"] == -1) & out["density_bear"], "density_dir"] = -1
 
     out["imb_atr"] = atr(out["high"], out["low"], out["close"], int(cfg["imb_atr_len"]))
     out["body_pct"] = ((out["close"] - out["open"]).abs() / out["rng"]) * 100.0
-    out["is_up_1"] = (out["open"].shift(1) <= out["close"].shift(1))
+    out["is_up_1"] = out["open"].shift(1) <= out["close"].shift(1)
     out["price_diff"] = (out["high"].shift(1) - out["low"].shift(1)).abs()
     out["big_body"] = out["body_pct"].shift(1) >= float(cfg["imb_body_pct"])
-    out["gap_closed"] = np.where(out["is_up_1"], out["high"].shift(2) >= out["low"], out["low"].shift(2) <= out["high"])
-    out["imbalance_event"] = (out["price_diff"] > out["imb_atr"] * float(cfg["imb_atr_mult"])) & out["big_body"] & (~pd.Series(out["gap_closed"], index=out.index).fillna(False))
+
+    out["gap_closed"] = np.where(
+        out["is_up_1"],
+        out["high"].shift(2) >= out["low"],
+        out["low"].shift(2) <= out["high"],
+    )
+
+    out["imbalance_event"] = (
+        (out["price_diff"] > out["imb_atr"] * float(cfg["imb_atr_mult"]))
+        & out["big_body"]
+        & (~pd.Series(out["gap_closed"], index=out.index).fillna(False))
+    )
     out["imb_dir"] = np.where(out["imbalance_event"], np.where(out["is_up_1"], 1, -1), 0)
     out["imb_top"] = np.where(out["is_up_1"], out["low"], out["low"].shift(2))
     out["imb_bot"] = np.where(out["is_up_1"], out["high"].shift(2), out["high"])
 
-    out["imb_bull_active"] = out["imbalance_event"].shift(1).fillna(False) & (pd.Series(out["imb_dir"], index=out.index).shift(1) == 1) & (out["high"] >= pd.Series(out["imb_bot"], index=out.index).shift(1)) & (out["low"] <= pd.Series(out["imb_top"], index=out.index).shift(1))
-    out["imb_bear_active"] = out["imbalance_event"].shift(1).fillna(False) & (pd.Series(out["imb_dir"], index=out.index).shift(1) == -1) & (out["high"] >= pd.Series(out["imb_bot"], index=out.index).shift(1)) & (out["low"] <= pd.Series(out["imb_top"], index=out.index).shift(1))
+    out["imb_bull_active"] = (
+        out["imbalance_event"].shift(1).fillna(False)
+        & (pd.Series(out["imb_dir"], index=out.index).shift(1) == 1)
+        & (out["high"] >= pd.Series(out["imb_bot"], index=out.index).shift(1))
+        & (out["low"] <= pd.Series(out["imb_top"], index=out.index).shift(1))
+    )
+    out["imb_bear_active"] = (
+        out["imbalance_event"].shift(1).fillna(False)
+        & (pd.Series(out["imb_dir"], index=out.index).shift(1) == -1)
+        & (out["high"] >= pd.Series(out["imb_bot"], index=out.index).shift(1))
+        & (out["low"] <= pd.Series(out["imb_top"], index=out.index).shift(1))
+    )
+
     out["imb_dir_active"] = 0
     out.loc[(out["macro_dir"] == 1) & out["imb_bull_active"], "imb_dir_active"] = 1
     out.loc[(out["macro_dir"] == -1) & out["imb_bear_active"], "imb_dir_active"] = -1
@@ -460,15 +604,28 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
     out["vp_ready"] = out["vp_poc"].notna() & out["vp_vah"].notna() & out["vp_val"].notna()
     out["vp_inside_va"] = out["vp_ready"] & (out["close"] >= out["vp_val"]) & (out["close"] <= out["vp_vah"])
     out["vp_outside_va"] = out["vp_ready"] & (~out["vp_inside_va"])
-    out["vp_dist_to_poc_pct"] = np.where(out["vp_ready"] & (out["vp_poc"] != 0), (out["close"] - out["vp_poc"]) / out["vp_poc"] * 100.0, np.nan)
+    out["vp_dist_to_poc_pct"] = np.where(
+        out["vp_ready"] & (out["vp_poc"] != 0),
+        (out["close"] - out["vp_poc"]) / out["vp_poc"] * 100.0,
+        np.nan,
+    )
     out["vp_neutral_band"] = out["vp_ready"] & (out["vp_dist_to_poc_pct"].abs() <= float(cfg["vp_bias_tol_pct"]))
+
     out["vp_bias"] = 0
     out.loc[out["vp_ready"] & (~out["vp_neutral_band"]) & (out["close"] > out["vp_poc"]), "vp_bias"] = 1
     out.loc[out["vp_ready"] & (~out["vp_neutral_band"]) & (out["close"] < out["vp_poc"]), "vp_bias"] = -1
 
     out["vp_dir"] = 0
-    bull_vp = (out["macro_dir"] == 1) & (out["vp_bias"] >= 0) & (out["vp_inside_va"] | (out["close"] >= out["vp_poc"]))
-    bear_vp = (out["macro_dir"] == -1) & (out["vp_bias"] <= 0) & (out["vp_inside_va"] | (out["close"] <= out["vp_poc"]))
+    bull_vp = (
+        (out["macro_dir"] == 1)
+        & (out["vp_bias"] >= 0)
+        & (out["vp_inside_va"] | (out["close"] >= out["vp_poc"]))
+    )
+    bear_vp = (
+        (out["macro_dir"] == -1)
+        & (out["vp_bias"] <= 0)
+        & (out["vp_inside_va"] | (out["close"] <= out["vp_poc"]))
+    )
     out.loc[bull_vp, "vp_dir"] = 1
     out.loc[bear_vp, "vp_dir"] = -1
 
@@ -478,12 +635,31 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
     out["liq_high"] = _valuewhen_last(out["pivot_high"], out["pivot_high"])
     out["liq_low"] = _valuewhen_last(out["pivot_low"], out["pivot_low"])
 
-    out["bull_sweep_now"] = (out["macro_dir"] == 1) & out["liq_low"].notna() & (out["low"] < out["liq_low"]) & (out["close"] > out["liq_low"])
-    out["bear_sweep_now"] = (out["macro_dir"] == -1) & out["liq_high"].notna() & (out["high"] > out["liq_high"]) & (out["close"] < out["liq_high"])
+    out["bull_sweep_now"] = (
+        (out["macro_dir"] == 1)
+        & out["liq_low"].notna()
+        & (out["low"] < out["liq_low"])
+        & (out["close"] > out["liq_low"])
+    )
+    out["bear_sweep_now"] = (
+        (out["macro_dir"] == -1)
+        & out["liq_high"].notna()
+        & (out["high"] > out["liq_high"])
+        & (out["close"] < out["liq_high"])
+    )
     out["bull_sweep_bars"] = _bars_since(out["bull_sweep_now"])
     out["bear_sweep_bars"] = _bars_since(out["bear_sweep_now"])
-    out["liq_bull_active"] = out["bull_sweep_bars"].notna() & (out["bull_sweep_bars"] >= 0) & (out["bull_sweep_bars"] <= int(cfg["liq_sweep_ttl"]))
-    out["liq_bear_active"] = out["bear_sweep_bars"].notna() & (out["bear_sweep_bars"] >= 0) & (out["bear_sweep_bars"] <= int(cfg["liq_sweep_ttl"]))
+    out["liq_bull_active"] = (
+        out["bull_sweep_bars"].notna()
+        & (out["bull_sweep_bars"] >= 0)
+        & (out["bull_sweep_bars"] <= int(cfg["liq_sweep_ttl"]))
+    )
+    out["liq_bear_active"] = (
+        out["bear_sweep_bars"].notna()
+        & (out["bear_sweep_bars"] >= 0)
+        & (out["bear_sweep_bars"] <= int(cfg["liq_sweep_ttl"]))
+    )
+
     out["liq_dir"] = 0
     out.loc[(out["macro_dir"] == 1) & out["liq_bull_active"], "liq_dir"] = 1
     out.loc[(out["macro_dir"] == -1) & out["liq_bear_active"], "liq_dir"] = -1
@@ -491,8 +667,19 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
     # -------------------------------------------------------------------------
     # 4) Active confluence core
     # -------------------------------------------------------------------------
-    out["act_count_bull"] = (out["density_dir"] == 1).astype(int) + (out["imb_dir_active"] == 1).astype(int) + (out["vp_dir"] == 1).astype(int) + (out["liq_dir"] == 1).astype(int)
-    out["act_count_bear"] = (out["density_dir"] == -1).astype(int) + (out["imb_dir_active"] == -1).astype(int) + (out["vp_dir"] == -1).astype(int) + (out["liq_dir"] == -1).astype(int)
+    out["act_count_bull"] = (
+        (out["density_dir"] == 1).astype(int)
+        + (out["imb_dir_active"] == 1).astype(int)
+        + (out["vp_dir"] == 1).astype(int)
+        + (out["liq_dir"] == 1).astype(int)
+    )
+    out["act_count_bear"] = (
+        (out["density_dir"] == -1).astype(int)
+        + (out["imb_dir_active"] == -1).astype(int)
+        + (out["vp_dir"] == -1).astype(int)
+        + (out["liq_dir"] == -1).astype(int)
+    )
+
     out["activity_dir"] = 0
     out.loc[(out["macro_dir"] == 1) & (out["act_count_bull"] >= 2), "activity_dir"] = 1
     out.loc[(out["macro_dir"] == -1) & (out["act_count_bear"] >= 2), "activity_dir"] = -1
@@ -500,62 +687,102 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
     core_raw_lo = np.full(len(out), np.nan)
     core_raw_hi = np.full(len(out), np.nan)
 
+    imb_bot_shift = out["imb_bot"].shift(1)
+    imb_top_shift = out["imb_top"].shift(1)
+
     for i in range(len(out)):
         ad = int(out["activity_dir"].iat[i])
+        if ad == 0:
+            continue
+
+        tmp_lo = out["macro_zone_lo"].iat[i]
+        tmp_hi = out["macro_zone_hi"].iat[i]
+        if np.isnan(tmp_lo) or np.isnan(tmp_hi):
+            continue
+
         if ad == 1:
-            tmp_lo = out["macro_zone_lo"].iat[i]
-            tmp_hi = out["macro_zone_hi"].iat[i]
-            if np.isnan(tmp_lo) or np.isnan(tmp_hi):
-                continue
             if out["density_dir"].iat[i] == 1:
                 tmp_lo = max(tmp_lo, out["density_bot"].iat[i])
                 tmp_hi = min(tmp_hi, out["density_top"].iat[i])
+
             if out["imb_dir_active"].iat[i] == 1:
-                imb_bot_prev = out["imb_bot"].shift(1).iat[i]
-                imb_top_prev = out["imb_top"].shift(1).iat[i]
+                imb_bot_prev = imb_bot_shift.iat[i]
+                imb_top_prev = imb_top_shift.iat[i]
                 if np.isfinite(imb_bot_prev) and np.isfinite(imb_top_prev):
                     tmp_lo = max(tmp_lo, imb_bot_prev)
                     tmp_hi = min(tmp_hi, imb_top_prev)
+
             if out["vp_dir"].iat[i] == 1 and bool(out["vp_ready"].iat[i]):
                 tmp_lo = max(tmp_lo, out["vp_val"].iat[i])
                 tmp_hi = min(tmp_hi, out["vp_vah"].iat[i])
-            core_raw_lo[i] = tmp_lo
-            core_raw_hi[i] = tmp_hi
+
         elif ad == -1:
-            tmp_lo = out["macro_zone_lo"].iat[i]
-            tmp_hi = out["macro_zone_hi"].iat[i]
-            if np.isnan(tmp_lo) or np.isnan(tmp_hi):
-                continue
             if out["density_dir"].iat[i] == -1:
                 tmp_lo = max(tmp_lo, out["density_bot"].iat[i])
                 tmp_hi = min(tmp_hi, out["density_top"].iat[i])
+
             if out["imb_dir_active"].iat[i] == -1:
-                imb_bot_prev = out["imb_bot"].shift(1).iat[i]
-                imb_top_prev = out["imb_top"].shift(1).iat[i]
+                imb_bot_prev = imb_bot_shift.iat[i]
+                imb_top_prev = imb_top_shift.iat[i]
                 if np.isfinite(imb_bot_prev) and np.isfinite(imb_top_prev):
                     tmp_lo = max(tmp_lo, imb_bot_prev)
                     tmp_hi = min(tmp_hi, imb_top_prev)
+
             if out["vp_dir"].iat[i] == -1 and bool(out["vp_ready"].iat[i]):
                 tmp_lo = max(tmp_lo, out["vp_val"].iat[i])
                 tmp_hi = min(tmp_hi, out["vp_vah"].iat[i])
-            core_raw_lo[i] = tmp_lo
-            core_raw_hi[i] = tmp_hi
+
+        core_raw_lo[i] = tmp_lo
+        core_raw_hi[i] = tmp_hi
 
     out["core_raw_lo"] = core_raw_lo
     out["core_raw_hi"] = core_raw_hi
-    out["core_overlap_valid"] = (out["activity_dir"] != 0) & out["core_raw_lo"].notna() & out["core_raw_hi"].notna() & (out["core_raw_hi"] > out["core_raw_lo"])
-    out["core_raw_size"] = np.where(out["core_overlap_valid"], (out["core_raw_hi"] - out["core_raw_lo"]).abs(), np.nan)
-    out["core_pad"] = np.where(out["core_overlap_valid"], out["core_raw_size"] * float(cfg["core_pad_pct"]), np.nan)
+    out["core_overlap_valid"] = (
+        (out["activity_dir"] != 0)
+        & out["core_raw_lo"].notna()
+        & out["core_raw_hi"].notna()
+        & (out["core_raw_hi"] > out["core_raw_lo"])
+    )
+    out["core_raw_size"] = np.where(
+        out["core_overlap_valid"],
+        (out["core_raw_hi"] - out["core_raw_lo"]).abs(),
+        np.nan,
+    )
+    out["core_pad"] = np.where(
+        out["core_overlap_valid"],
+        out["core_raw_size"] * float(cfg["core_pad_pct"]),
+        np.nan,
+    )
     out["core_base_lo"] = np.where(out["core_overlap_valid"], out["core_raw_lo"] - out["core_pad"], np.nan)
     out["core_base_hi"] = np.where(out["core_overlap_valid"], out["core_raw_hi"] + out["core_pad"], np.nan)
-    out["core_base_size"] = np.where(out["core_overlap_valid"], (out["core_base_hi"] - out["core_base_lo"]).abs(), np.nan)
+    out["core_base_size"] = np.where(
+        out["core_overlap_valid"],
+        (out["core_base_hi"] - out["core_base_lo"]).abs(),
+        np.nan,
+    )
     out["core_floor"] = out["atr_now"] * float(cfg["core_atr_mult"])
-    out["core_final_size"] = np.where(out["core_overlap_valid"], np.maximum(out["core_base_size"], np.maximum(out["core_floor"], float(cfg["core_min_abs"]))), np.nan)
-    out["core_extra_half"] = np.where(out["core_overlap_valid"], np.maximum(0.0, (out["core_final_size"] - out["core_base_size"]) * 0.5), np.nan)
+    out["core_final_size"] = np.where(
+        out["core_overlap_valid"],
+        np.maximum(out["core_base_size"], np.maximum(out["core_floor"], float(cfg["core_min_abs"]))),
+        np.nan,
+    )
+    out["core_extra_half"] = np.where(
+        out["core_overlap_valid"],
+        np.maximum(0.0, (out["core_final_size"] - out["core_base_size"]) * 0.5),
+        np.nan,
+    )
     out["core_zone_lo"] = np.where(out["core_overlap_valid"], out["core_base_lo"] - out["core_extra_half"], np.nan)
     out["core_zone_hi"] = np.where(out["core_overlap_valid"], out["core_base_hi"] + out["core_extra_half"], np.nan)
-    out["core_zone_ready"] = (out["activity_dir"] != 0) & out["core_zone_lo"].notna() & out["core_zone_hi"].notna()
-    out["in_core_zone"] = out["core_zone_ready"] & (out["close"] >= out["core_zone_lo"]) & (out["close"] <= out["core_zone_hi"])
+    out["core_zone_ready"] = (
+        (out["activity_dir"] != 0)
+        & out["core_zone_lo"].notna()
+        & out["core_zone_hi"].notna()
+    )
+    out["in_core_zone"] = (
+        out["core_zone_ready"]
+        & (out["close"] >= out["core_zone_lo"])
+        & (out["close"] <= out["core_zone_hi"])
+    )
     out["vp_agrees_with_confluence"] = (out["vp_dir"] != 0) & (out["vp_dir"] == out["activity_dir"])
 
     # -------------------------------------------------------------------------
@@ -567,14 +794,21 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
     tp = (out["high"] + out["low"] + out["close"]) / 3.0
     rmf = tp * out["volume"]
     tp_diff = tp.diff()
+
     pos_flow = rmf.where(tp_diff > 0, 0.0)
     neg_flow = rmf.where(tp_diff < 0, 0.0).abs()
+
     mfi_fast_pos = pos_flow.rolling(int(cfg["mfi_fast_len"]), min_periods=int(cfg["mfi_fast_len"])).sum()
     mfi_fast_neg = neg_flow.rolling(int(cfg["mfi_fast_len"]), min_periods=int(cfg["mfi_fast_len"])).sum()
     mfi_slow_pos = pos_flow.rolling(int(cfg["mfi_slow_len"]), min_periods=int(cfg["mfi_slow_len"])).sum()
     mfi_slow_neg = neg_flow.rolling(int(cfg["mfi_slow_len"]), min_periods=int(cfg["mfi_slow_len"])).sum()
-    out["mfi_fast"] = 100.0 - (100.0 / (1.0 + _safe_div(mfi_fast_pos, mfi_fast_neg.replace(0.0, np.nan), fill=np.nan)))
-    out["mfi_slow"] = 100.0 - (100.0 / (1.0 + _safe_div(mfi_slow_pos, mfi_slow_neg.replace(0.0, np.nan), fill=np.nan)))
+
+    out["mfi_fast"] = 100.0 - (
+        100.0 / (1.0 + _safe_div(mfi_fast_pos, mfi_fast_neg.replace(0.0, np.nan), fill=np.nan))
+    )
+    out["mfi_slow"] = 100.0 - (
+        100.0 / (1.0 + _safe_div(mfi_slow_pos, mfi_slow_neg.replace(0.0, np.nan), fill=np.nan))
+    )
 
     mom_mode = str(cfg["mom_mode"]).upper()
     out["mom_bull_ok"] = np.where(
@@ -587,6 +821,7 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
         (out["macd_line"] < out["macd_sig"]) & (out["macd_line"] <= out["macd_line"].shift(1)),
         (out["mfi_slow"] < 50.0) & (out["mfi_fast"] < out["mfi_fast"].shift(1)),
     )
+
     out["momentum_ok"] = False
     out.loc[out["activity_dir"] == 1, "momentum_ok"] = pd.Series(out["mom_bull_ok"], index=out.index)
     out.loc[out["activity_dir"] == -1, "momentum_ok"] = pd.Series(out["mom_bear_ok"], index=out.index)
@@ -597,8 +832,17 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
     out["bear_body"] = (out["close"] < out["open"]) & (out["body_pct_now"] >= float(cfg["body_min_pct"]))
 
     out["ema_fast"] = ema(out["close"], int(cfg["ema_fast_len"]))
-    out["core_retest_bull"] = out["core_zone_ready"] & (out["low"] <= out["core_zone_hi"]) & (out["close"] >= out["core_zone_lo"])
-    out["core_retest_bear"] = out["core_zone_ready"] & (out["high"] >= out["core_zone_lo"]) & (out["close"] <= out["core_zone_hi"])
+
+    out["core_retest_bull"] = (
+        out["core_zone_ready"]
+        & (out["low"] <= out["core_zone_hi"])
+        & (out["close"] >= out["core_zone_lo"])
+    )
+    out["core_retest_bear"] = (
+        out["core_zone_ready"]
+        & (out["high"] >= out["core_zone_lo"])
+        & (out["close"] <= out["core_zone_hi"])
+    )
     out["ema_retest_bull"] = (out["low"] <= out["ema_fast"]) & (out["close"] >= out["ema_fast"])
     out["ema_retest_bear"] = (out["high"] >= out["ema_fast"]) & (out["close"] <= out["ema_fast"])
 
@@ -613,17 +857,37 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
     out["trigger_now"] = False
     out.loc[out["activity_dir"] == 1, "trigger_now"] = out["bull_body"] & out["retest_ok"] & out["break_ok"]
     out.loc[out["activity_dir"] == -1, "trigger_now"] = out["bear_body"] & out["retest_ok"] & out["break_ok"]
-    out["trigger_bars"] = _bars_since(out["trigger_now"])
-    out["trigger_ok"] = out["trigger_bars"].notna() & (out["trigger_bars"] >= 0) & (out["trigger_bars"] <= int(cfg["trigger_ttl"]))
 
-    out["ic_ready"] = bool(cfg["engine_on"]) & out["macro_zone_ready"] & out["core_zone_ready"] & (out["activity_dir"] != 0) & out["momentum_ok"]
+    out["trigger_bars"] = _bars_since(out["trigger_now"])
+    out["trigger_ok"] = (
+        out["trigger_bars"].notna()
+        & (out["trigger_bars"] >= 0)
+        & (out["trigger_bars"] <= int(cfg["trigger_ttl"]))
+    )
+
+    out["ic_ready"] = (
+        bool(cfg["engine_on"])
+        & out["macro_zone_ready"]
+        & out["core_zone_ready"]
+        & (out["activity_dir"] != 0)
+        & out["momentum_ok"]
+    )
     out["ic_valid"] = out["ic_ready"] & out["trigger_ok"]
     out["ic_in_macro"] = out["ic_ready"] & out["in_macro_zone"]
     out["ic_in_core"] = out["ic_ready"] & out["in_core_zone"]
 
     out["ic_ttl_raw"] = _bars_since(out["ic_in_core"])
-    out["ic_active"] = out["ic_valid"] & out["ic_ttl_raw"].notna() & (out["ic_ttl_raw"] >= 0) & (out["ic_ttl_raw"] <= int(cfg["hold_bars"]))
-    out["ic_ttl"] = np.where(out["ic_active"], np.maximum(0, int(cfg["hold_bars"]) - out["ic_ttl_raw"]), 0)
+    out["ic_active"] = (
+        out["ic_valid"]
+        & out["ic_ttl_raw"].notna()
+        & (out["ic_ttl_raw"] >= 0)
+        & (out["ic_ttl_raw"] <= int(cfg["hold_bars"]))
+    )
+    out["ic_ttl"] = np.where(
+        out["ic_active"],
+        np.maximum(0, int(cfg["hold_bars"]) - out["ic_ttl_raw"]),
+        0,
+    )
 
     out["ic_score"] = 0
     out["ic_score"] += (out["mtf_dir"] != 0).astype(int)
@@ -638,18 +902,18 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
     out.loc[(out["ic_score"] >= 3) & (out["ic_score"] < 4), "ic_strength"] = 1
 
     out["ic_quality"] = _clamp(
-        _boolf(out["in_macro_zone"]) * 0.15 +
-        _boolf(out["in_core_zone"]) * 0.20 +
-        _boolf(out["momentum_ok"]) * 0.15 +
-        _boolf(out["trigger_ok"]) * 0.20 +
-        _boolf((out["act_count_bull"] >= 2) | (out["act_count_bear"] >= 2)) * 0.15 +
-        _boolf(out["ic_active"]) * 0.15,
+        _boolf(out["in_macro_zone"]) * 0.15
+        + _boolf(out["in_core_zone"]) * 0.20
+        + _boolf(out["momentum_ok"]) * 0.15
+        + _boolf(out["trigger_ok"]) * 0.20
+        + _boolf((out["act_count_bull"] >= 2) | (out["act_count_bear"] >= 2)) * 0.15
+        + _boolf(out["ic_active"]) * 0.15,
         0.0,
         1.0,
     )
 
     # -------------------------------------------------------------------------
-    # Export aliases for parity work
+    # Export aliases for parity / website
     # -------------------------------------------------------------------------
     out["sc_confl_dir"] = out["activity_dir"]
     out["sc_confl_mtf_avg"] = out["mtf_avg"]
@@ -673,6 +937,7 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
     out["sc_confl_momentum_ok"] = out["momentum_ok"].astype(float)
     out["sc_confl_trigger_ok"] = out["trigger_ok"].astype(float)
     out["sc_confl_ready"] = out["ic_ready"].astype(float)
+    out["sc_confl_valid"] = out["ic_valid"].astype(float)
     out["sc_confl_active"] = out["ic_active"].astype(float)
     out["sc_confl_ttl"] = out["ic_ttl"]
     out["sc_confl_score"] = out["ic_score"]
@@ -688,89 +953,102 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
 
     return out
 
+
 # =============================================================================
-# TEST BLOCK
+# PAYLOAD BUILDER
 # =============================================================================
-if __name__ == "__main__":
-    import argparse
-    from pathlib import Path
 
-    parser = argparse.ArgumentParser(description="Run SmartChart r_confluence parity module on CSV data.")
-    parser.add_argument("csv_path", nargs="?", default="data/xauusd_m1_full.csv")
-    parser.add_argument("--tail", type=int, default=5)
-    args = parser.parse_args()
+def build_confluence_latest_payload(
+    df: pd.DataFrame,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    result = r_confluence(df, config=config)
+    if result.empty:
+        raise ValueError("Confluence payload build failed: empty dataframe result.")
 
-    csv_path = Path(args.csv_path)
-    if not csv_path.exists():
-        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    row = result.iloc[-1]
 
-    df0 = pd.read_csv(csv_path)
+    direction = _safe_int(row.get("sc_confl_dir")) or 0
+    mtf_dir = _safe_int(row.get("sc_confl_mtf_dir")) or 0
+    macro_dir = _safe_int(row.get("sc_confl_macro_dir")) or 0
+    vp_bias = _safe_int(row.get("sc_confl_vp_bias")) or 0
+    vp_dir = _safe_int(row.get("sc_confl_vp_dir")) or 0
+    liq_dir = _safe_int(row.get("sc_confl_liq_dir")) or 0
+    density_dir = _safe_int(row.get("sc_confl_density_dir")) or 0
+    imb_dir = _safe_int(row.get("sc_confl_imb_dir")) or 0
+    ic_strength = _safe_int(row.get("sc_confl_strength")) or 0
 
-    # Normalize incoming CSV column names
-    df0.columns = [str(c).strip() for c in df0.columns]
+    payload: Dict[str, Any] = {
+        "indicator": "confluence",
+        "name": "SmartChart Confluence Engine",
+        "version": "confluence_payload_v1",
 
-    rename_map = {}
-    for c in df0.columns:
-        cl = c.lower().strip()
-        if cl == "open":
-            rename_map[c] = "open"
-        elif cl == "high":
-            rename_map[c] = "high"
-        elif cl == "low":
-            rename_map[c] = "low"
-        elif cl == "close":
-            rename_map[c] = "close"
-        elif cl in ["volume", "vol", "tick_volume", "tick volume"]:
-            rename_map[c] = "volume"
-        elif cl in ["datetime", "time", "date", "timestamp"]:
-            rename_map[c] = "datetime"
+        "timestamp": str(result.index[-1]),
 
-    df0 = df0.rename(columns=rename_map)
+        "state": {
+            "direction": direction,
+            "direction_label": _dir_label(direction),
+            "mtf_dir": mtf_dir,
+            "mtf_dir_label": _dir_label(mtf_dir),
+            "macro_dir": macro_dir,
+            "macro_dir_label": _dir_label(macro_dir),
+            "vp_bias": vp_bias,
+            "vp_bias_label": _dir_label(vp_bias),
+            "vp_dir": vp_dir,
+            "vp_dir_label": _dir_label(vp_dir),
+            "liq_dir": liq_dir,
+            "liq_dir_label": _dir_label(liq_dir),
+            "density_dir": density_dir,
+            "density_dir_label": _dir_label(density_dir),
+            "imbalance_dir": imb_dir,
+            "imbalance_dir_label": _dir_label(imb_dir),
+        },
 
-    print("Detected CSV columns:", df0.columns.tolist())
+        "scores": {
+            "mtf_avg": _safe_float(row.get("sc_confl_mtf_avg")),
+            "delta_norm": _safe_float(row.get("sc_confl_delta_norm")),
+            "score": _safe_int(row.get("sc_confl_score")),
+            "strength": ic_strength,
+            "strength_label": _strength_label(ic_strength),
+            "quality": _safe_float(row.get("sc_confl_quality")),
+        },
 
-    if "datetime" not in df0.columns:
-        raise ValueError(
-            f"Could not normalize datetime column. Found columns: {list(df0.columns)}"
-        )
+        "status": {
+            "macro_ready": _safe_bool(row.get("sc_confl_macro_ready")),
+            "in_macro": _safe_bool(row.get("sc_confl_in_macro")),
+            "core_ready": _safe_bool(row.get("sc_confl_core_ready")),
+            "in_core": _safe_bool(row.get("sc_confl_in_core")),
+            "density_event": _safe_bool(row.get("sc_confl_density_event")),
+            "imbalance_live": _safe_bool(row.get("sc_confl_imb_live")),
+            "vp_inside_va": _safe_bool(row.get("sc_confl_vp_inside_va")),
+            "vp_agrees_with_confluence": _safe_bool(row.get("sc_confl_vp_agree")),
+            "momentum_ok": _safe_bool(row.get("sc_confl_momentum_ok")),
+            "trigger_ok": _safe_bool(row.get("sc_confl_trigger_ok")),
+            "ready": _safe_bool(row.get("sc_confl_ready")),
+            "valid": _safe_bool(row.get("sc_confl_valid")),
+            "active": _safe_bool(row.get("sc_confl_active")),
+            "ttl": _safe_int(row.get("sc_confl_ttl")) or 0,
+        },
 
-    df0["datetime"] = pd.to_datetime(df0["datetime"], utc=False)
-    df0 = df0.set_index("datetime").sort_index()
+        "zones": {
+            "macro_zone_lo": _safe_float(row.get("sc_confl_macro_lo")),
+            "macro_zone_hi": _safe_float(row.get("sc_confl_macro_hi")),
+            "core_zone_lo": _safe_float(row.get("sc_confl_core_lo")),
+            "core_zone_hi": _safe_float(row.get("sc_confl_core_hi")),
+        },
 
-    required = ["open", "high", "low", "close", "volume"]
-    missing = [c for c in required if c not in df0.columns]
-    if missing:
-        raise ValueError(
-            f"After normalization, missing required columns: {missing}. Found: {list(df0.columns)}"
-        )
+        "volume_profile": {
+            "val": _safe_float(row.get("sc_confl_vp_val")),
+            "poc": _safe_float(row.get("sc_confl_vp_poc")),
+            "vah": _safe_float(row.get("sc_confl_vp_vah")),
+            "dist_to_poc_pct": _safe_float(row.get("sc_confl_vp_dist_to_poc_pct")),
+        },
 
-    result = r_confluence(df0)
+        "price": {
+            "close": _safe_float(row.get("close")),
+            "high": _safe_float(row.get("high")),
+            "low": _safe_float(row.get("low")),
+        },
+    }
 
-    cols = [
-        "close",
-        "sc_confl_dir",
-        "sc_confl_mtf_avg",
-        "sc_confl_macro_ready",
-        "sc_confl_core_ready",
-        "sc_confl_density_dir",
-        "sc_confl_imb_dir",
-        "sc_confl_vp_dir",
-        "sc_confl_liq_dir",
-        "sc_confl_momentum_ok",
-        "sc_confl_trigger_ok",
-        "sc_confl_ready",
-        "sc_confl_active",
-        "sc_confl_ttl",
-        "sc_confl_score",
-        "sc_confl_strength",
-        "sc_confl_quality",
-        "sc_confl_macro_lo",
-        "sc_confl_macro_hi",
-        "sc_confl_core_lo",
-        "sc_confl_core_hi",
-        "sc_confl_vp_val",
-        "sc_confl_vp_poc",
-        "sc_confl_vp_vah",
-    ]
-
-    print(result[cols].tail(args.tail).to_string())
+    return payload

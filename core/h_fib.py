@@ -130,7 +130,7 @@ def _resample_ohlc(df: pd.DataFrame, tf: str) -> pd.DataFrame:
 def _pivot_high_confirmed(series: pd.Series, left: int, right: int) -> pd.Series:
     """
     Pine mirror for ta.pivothigh(high, left, right):
-    return pivot price on the confirmation bar, not on the pivot center bar.
+    return pivot price on the confirmation bar, not the pivot center bar.
     """
     left = max(1, int(left))
     right = max(1, int(right))
@@ -156,7 +156,7 @@ def _pivot_high_confirmed(series: pd.Series, left: int, right: int) -> pd.Series
 def _pivot_low_confirmed(series: pd.Series, left: int, right: int) -> pd.Series:
     """
     Pine mirror for ta.pivotlow(low, left, right):
-    return pivot price on the confirmation bar, not on the pivot center bar.
+    return pivot price on the confirmation bar, not the pivot center bar.
     """
     left = max(1, int(left))
     right = max(1, int(right))
@@ -220,19 +220,7 @@ def _score_tf(
     rb: int,
 ) -> pd.Series:
     """
-    Pine mirror of:
-
-    f_score_tf(_tf, _prevLow, _prevHigh, _lb, _rb) =>
-        _c  = request.security(..., close)
-        _ph = request.security(..., ta.valuewhen(not na(ta.pivothigh(...)), ta.pivothigh(...), 0))
-        _pl = request.security(..., ta.valuewhen(not na(ta.pivotlow(...)), ta.pivotlow(...), 0))
-        _bullOk = not na(_ph) and (_ph > _prevLow)
-        _bearOk = not na(_pl) and (_pl < _prevHigh)
-        _bullMid = _prevLow + ((_ph - _prevLow) * 0.50)
-        _bearMid = _prevHigh - ((_prevHigh - _pl) * 0.50)
-        _bullScore = _bullOk and _c > _bullMid ? 1.0 : 0.0
-        _bearScore = _bearOk and _c < _bearMid ? -1.0 : 0.0
-        _bullScore + _bearScore
+    Pine mirror of the MTF scoring function.
     """
     htf = _resample_ohlc(df, tf)
 
@@ -310,6 +298,33 @@ def _mtf_state_text(avg: pd.Series) -> pd.Series:
         index=avg.index,
         dtype=object,
     )
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(value):
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if pd.isna(value):
+            return int(default)
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    try:
+        if pd.isna(value):
+            return default
+        return str(value)
+    except Exception:
+        return default
 
 
 # =============================================================================
@@ -488,7 +503,7 @@ def compute_fib_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None
         else pd.Series(0.0, index=idx, dtype=float)
     ).astype(float)
 
-    same_dir_count = (
+    bull_count = (
         (fib_score_1 > 0).astype(int)
         + (fib_score_2 > 0).astype(int)
         + (fib_score_3 > 0).astype(int)
@@ -497,7 +512,7 @@ def compute_fib_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None
         + (fib_score_6 > 0).astype(int)
     )
 
-    opp_dir_count = (
+    bear_count = (
         (fib_score_1 < 0).astype(int)
         + (fib_score_2 < 0).astype(int)
         + (fib_score_3 < 0).astype(int)
@@ -516,13 +531,13 @@ def compute_fib_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None
     )
 
     mtf_bull_agreement = pd.Series(
-        np.where(active_tf_count > 0, same_dir_count / active_tf_count, 0.0),
+        np.where(active_tf_count > 0, bull_count / active_tf_count, 0.0),
         index=idx,
         dtype=float,
     )
 
     mtf_bear_agreement = pd.Series(
-        np.where(active_tf_count > 0, opp_dir_count / active_tf_count, 0.0),
+        np.where(active_tf_count > 0, bear_count / active_tf_count, 0.0),
         index=idx,
         dtype=float,
     )
@@ -622,71 +637,89 @@ def run_fib_engine(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) ->
 
 
 # =============================================================================
-# TEST BLOCK
+# PAYLOAD BUILDER — WEBSITE SINGLE SOURCE OF TRUTH
 # =============================================================================
 
-if __name__ == "__main__":
-    n = 2000
-    idx = pd.date_range("2026-01-01", periods=n, freq="1min", tz="UTC")
-    x = np.arange(n)
+def build_fib_latest_payload(
+    df: pd.DataFrame,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    result = compute_fib_engine(df, config=config)
 
-    base = 100 + np.sin(x / 40.0) * 2.5 + np.linspace(0, 10, n)
+    if result.empty:
+        raise ValueError("Fib payload build failed: computed dataframe is empty")
 
-    df = pd.DataFrame(
-        {
-            "open": base + np.sin(x / 9.0) * 0.15,
-            "high": base + 0.65 + np.sin(x / 8.0) * 0.35,
-            "low": base - 0.65 + np.sin(x / 10.0) * 0.35,
-            "close": base + np.sin(x / 9.0) * 0.22,
-            "volume": 1000 + np.sin(x / 7.0) * 75 + np.linspace(0, 150, n),
+    last = result.iloc[-1]
+
+    timestamp = result.index[-1]
+    if isinstance(timestamp, pd.Timestamp):
+        timestamp_str = timestamp.isoformat()
+    else:
+        timestamp_str = str(timestamp)
+
+    payload: Dict[str, Any] = {
+        "debug_version": "fib_payload_v1",
+        "module": "fib",
+        "name": "SmartChart Fib Engine",
+        "timestamp": timestamp_str,
+
+        "state": {
+            "direction": _safe_int(last.get("sc_fib_dir"), 0),
+            "direction_text": _safe_str(last.get("sc_fib_dir_text"), "NEUTRAL"),
+            "active_zone": _safe_int(last.get("sc_fib_active_zone"), 0),
+            "active_zone_text": _safe_str(last.get("sc_fib_active_zone_text"), "NONE"),
+            "contract_state": _safe_int(last.get("sc_fib_contract_state"), 0),
+            "contract_text": (
+                "BULL"
+                if _safe_int(last.get("sc_fib_contract_state"), 0) == 1
+                else "BEAR"
+                if _safe_int(last.get("sc_fib_contract_state"), 0) == -1
+                else "MIXED"
+            ),
+            "mtf_state_text": _safe_str(last.get("sc_fib_mtf_state_text"), "MIXED"),
         },
-        index=idx,
-    )
 
-    result = run_fib_engine(df)
+        "anchors": {
+            "prev_day_high": _safe_float(last.get("sc_fib_prev_day_high")),
+            "prev_day_low": _safe_float(last.get("sc_fib_prev_day_low")),
+            "bull_anchor_high": _safe_float(last.get("sc_fib_anchor_bull_high")),
+            "bear_anchor_low": _safe_float(last.get("sc_fib_anchor_bear_low")),
+            "bull_anchor_bar": _safe_float(last.get("sc_fib_anchor_bull_bar")),
+            "bear_anchor_bar": _safe_float(last.get("sc_fib_anchor_bear_bar")),
+            "bull_ready": _safe_float(last.get("sc_fib_bull_ready")),
+            "bear_ready": _safe_float(last.get("sc_fib_bear_ready")),
+            "bull_latest": _safe_float(last.get("sc_fib_bull_latest")),
+            "bear_latest": _safe_float(last.get("sc_fib_bear_latest")),
+        },
 
-    print(
-        result[
-            [
-                "sc_fib_dir",
-                "sc_fib_active_zone",
-                "sc_fib_active_zone_text",
-                "sc_fib_prev_day_high",
-                "sc_fib_prev_day_low",
-                "sc_fib_mtf_avg",
-                "sc_fib_mtf_agreement",
-                "sc_fib_mtf_conflict",
-                "sc_fib_contract_state",
-            ]
-        ].tail(20)
-    )
+        "levels": {
+            "fib_0": _safe_float(last.get("sc_fib_0")),
+            "fib_25": _safe_float(last.get("sc_fib_25")),
+            "fib_33": _safe_float(last.get("sc_fib_33")),
+            "fib_50": _safe_float(last.get("sc_fib_50")),
+            "fib_615": _safe_float(last.get("sc_fib_615")),
+            "fib_66": _safe_float(last.get("sc_fib_66")),
+            "fib_78": _safe_float(last.get("sc_fib_78")),
+            "fib_1": _safe_float(last.get("sc_fib_1")),
+        },
 
-    print("\nFIB COUNTS")
-    print("dir != 0:", int((result["sc_fib_dir"] != 0).sum()))
-    print("zone 1:", int((result["sc_fib_active_zone"] == 1).sum()))
-    print("zone 2:", int((result["sc_fib_active_zone"] == 2).sum()))
-    print("zone 3:", int((result["sc_fib_active_zone"] == 3).sum()))
+        "mtf": {
+            "avg": _safe_float(last.get("sc_fib_mtf_avg")),
+            "agreement": _safe_float(last.get("sc_fib_mtf_agreement")),
+            "conflict": _safe_float(last.get("sc_fib_mtf_conflict")),
+            "score_1": _safe_float(last.get("sc_fib_score_1")),
+            "score_2": _safe_float(last.get("sc_fib_score_2")),
+            "score_3": _safe_float(last.get("sc_fib_score_3")),
+            "score_4": _safe_float(last.get("sc_fib_score_4")),
+            "score_5": _safe_float(last.get("sc_fib_score_5")),
+            "score_6": _safe_float(last.get("sc_fib_score_6")),
+        },
 
-    print("\nLATEST PARITY ROW")
-    cols = [
-        "sc_fib_dir",
-        "sc_fib_active_zone",
-        "sc_fib_active_zone_text",
-        "sc_fib_prev_day_high",
-        "sc_fib_prev_day_low",
-        "sc_fib_anchor_bull_high",
-        "sc_fib_anchor_bear_low",
-        "sc_fib_0",
-        "sc_fib_25",
-        "sc_fib_33",
-        "sc_fib_50",
-        "sc_fib_615",
-        "sc_fib_66",
-        "sc_fib_78",
-        "sc_fib_1",
-        "sc_fib_mtf_avg",
-        "sc_fib_mtf_agreement",
-        "sc_fib_mtf_conflict",
-        "sc_fib_contract_state",
-    ]
-    print(result[cols].tail(1).T)
+        "truth": {
+            "fib_dir": _safe_int(last.get("fib_dir"), 0),
+            "fib_zone": _safe_int(last.get("fib_zone"), 0),
+            "fib_zone_label": _safe_str(last.get("fib_zone_label"), "NONE"),
+        },
+    }
+
+    return payload

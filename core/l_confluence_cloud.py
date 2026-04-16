@@ -1,47 +1,21 @@
-"""
-==============================================================================
-SMARTCHART BACKEND — CONFLUENCE ENGINE
-File: r_confluence.py
-==============================================================================
-
-LOCKED STATE — CONFLUENCE ENGINE PARITY VERSION
-
-This module is the backend parity implementation of the locked
-SmartChart Confluence Engine v2.1.
-
-Logic preserved from Pine:
-- Trend Layer
-- Location Layer
-- Liquidity Layer
-- Momentum Layer
-- Trigger Layer
-- confReady / confInZone / confValid / confActive / confTTL
-- Confluence score and strength mapping
-- Active zone state outputs
-
-Important:
-- Visual plotting is NOT handled here
-- Pine visual/table parity is separate
-- Keep this module separate from l_confluence_cloud.py
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional
+
 import numpy as np
 import pandas as pd
 
 
-# ==============================================================================
+# =============================================================================
 # CONFIG
-# ==============================================================================
+# =============================================================================
 
 @dataclass
 class ConfluenceCloudConfig:
     min_strength: int = 4
 
-    # weights
+    # MTF weights
     w1: float = 1.0
     w5: float = 1.0
     w15: float = 1.0
@@ -49,7 +23,7 @@ class ConfluenceCloudConfig:
     w240: float = 1.0
     wD: float = 1.0
 
-    # higher-timeframe structural zone
+    # structural zone
     h1_lookback: int = 50
 
     # fixed TF mapping
@@ -67,9 +41,9 @@ class ConfluenceCloudConfig:
             }
 
 
-# ==============================================================================
+# =============================================================================
 # HELPERS
-# ==============================================================================
+# =============================================================================
 
 def validate_ohlcv(df: pd.DataFrame) -> None:
     required = {"open", "high", "low", "close", "volume"}
@@ -77,9 +51,51 @@ def validate_ohlcv(df: pd.DataFrame) -> None:
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
+    if df.empty:
+        raise ValueError("Input dataframe is empty.")
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("Confluence Cloud requires a DatetimeIndex.")
+
 
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if pd.isna(value):
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def safe_bool(value: Any, default: bool = False) -> bool:
+    try:
+        if pd.isna(value):
+            return default
+        return bool(value)
+    except Exception:
+        return default
+
+
+def safe_optional_float(value: Any) -> Optional[float]:
+    try:
+        if pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
 
 
 def ema(series: pd.Series, length: int) -> pd.Series:
@@ -107,9 +123,6 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
 
 
 def session_vwap(df: pd.DataFrame) -> pd.Series:
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError("VWAP requires DatetimeIndex.")
-
     dates = df.index.normalize()
     hlc3 = (df["high"] + df["low"] + df["close"]) / 3.0
     pv = hlc3 * df["volume"]
@@ -133,16 +146,15 @@ def session_vwap(df: pd.DataFrame) -> pd.Series:
 
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError("Resampling requires DatetimeIndex.")
-
-    out = pd.DataFrame({
-        "open": df["open"].resample(rule).first(),
-        "high": df["high"].resample(rule).max(),
-        "low": df["low"].resample(rule).min(),
-        "close": df["close"].resample(rule).last(),
-        "volume": df["volume"].resample(rule).sum(),
-    }).dropna()
+    out = pd.DataFrame(
+        {
+            "open": df["open"].resample(rule).first(),
+            "high": df["high"].resample(rule).max(),
+            "low": df["low"].resample(rule).min(),
+            "close": df["close"].resample(rule).last(),
+            "volume": df["volume"].resample(rule).sum(),
+        }
+    ).dropna()
 
     return out
 
@@ -152,9 +164,33 @@ def trend_check_ema200(df: pd.DataFrame) -> pd.Series:
     return pd.Series(np.where(df["close"] > e200, 1, -1), index=df.index, dtype=float)
 
 
-# ==============================================================================
+def dir_text(v: float) -> str:
+    if v > 0.60:
+        return "STRONG BULL"
+    if v > 0.20:
+        return "BULL"
+    if v < -0.60:
+        return "STRONG BEAR"
+    if v < -0.20:
+        return "BEAR"
+    return "NEUTRAL"
+
+
+def dir_color(v: float) -> str:
+    if v > 0.60:
+        return "lime"
+    if v > 0.20:
+        return "green"
+    if v < -0.60:
+        return "red"
+    if v < -0.20:
+        return "maroon"
+    return "gray"
+
+
+# =============================================================================
 # OUTPUT CONTRACT
-# ==============================================================================
+# =============================================================================
 
 @dataclass
 class ConfluenceCloudOutput:
@@ -163,6 +199,7 @@ class ConfluenceCloudOutput:
     cc_active_zone: bool
 
     cc_dir: int
+    cc_direction: str
     cc_strength_score: float
 
     bull_count: int
@@ -174,6 +211,7 @@ class ConfluenceCloudOutput:
 
     mtf_avg: float
     mtf_bias: str
+    mtf_bias_color: str
 
     t1: int
     t5: int
@@ -197,9 +235,9 @@ class ConfluenceCloudOutput:
     timestamp: Any
 
 
-# ==============================================================================
+# =============================================================================
 # CORE ENGINE
-# ==============================================================================
+# =============================================================================
 
 class ConfluenceCloudEngine:
     def __init__(self, config: Optional[ConfluenceCloudConfig] = None) -> None:
@@ -208,22 +246,19 @@ class ConfluenceCloudEngine:
     def calculate(self, df: pd.DataFrame) -> pd.DataFrame:
         validate_ohlcv(df)
 
-        if not isinstance(df.index, pd.DatetimeIndex):
-            raise ValueError("ConfluenceCloudEngine requires a DatetimeIndex.")
-
         c = self.config
         out = df.copy()
 
-        # ----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # Current timeframe confirmation layer
-        # ----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         out["rsi_value"] = rsi(out["close"], 14)
         out["vwap_value"] = session_vwap(out)
         out["macd_line"], out["signal_line"], out["macd_hist"] = macd(out["close"], 12, 26, 9)
 
-        # ----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # MTF trend gathering
-        # ----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         mtf_series = self._build_mtf_trend_map(out)
         for col in ["t1", "t5", "t15", "t60", "t240", "tD"]:
             out[col] = mtf_series[col]
@@ -246,15 +281,14 @@ class ConfluenceCloudEngine:
             + (out["tD"] == -1).astype(int)
         )
 
-        # ----------------------------------------------------------------------
-        # Current timeframe confirmation logic
-        # ----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Confirmation logic — kept aligned to Pine authority exactly
+        # ---------------------------------------------------------------------
         out["vwap_confirm"] = (
             ((out["bull_count"] > out["bear_count"]) & (out["close"] > out["vwap_value"]))
             | ((out["bear_count"] > out["bull_count"]) & (out["close"] < out["vwap_value"]))
         )
 
-        # This follows your Pine script exactly
         out["rsi_confirm"] = (
             ((out["bull_count"] > out["bear_count"]) & (out["rsi_value"] < 50))
             | ((out["bear_count"] > out["bull_count"]) & (out["rsi_value"] > 50))
@@ -265,9 +299,9 @@ class ConfluenceCloudEngine:
             | ((out["bear_count"] > out["bull_count"]) & (out["macd_line"] < out["signal_line"]))
         )
 
-        # ----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # Weighted MTF average
-        # ----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         w_sum = c.w1 + c.w5 + c.w15 + c.w60 + c.w240 + c.wD
 
         if w_sum > 0:
@@ -283,24 +317,23 @@ class ConfluenceCloudEngine:
             out["mtf_avg"] = 0.0
 
         out["mtf_avg"] = out["mtf_avg"].clip(-1.0, 1.0)
-        out["mtf_bias"] = out["mtf_avg"].apply(self._dir_text)
+        out["mtf_bias"] = out["mtf_avg"].apply(dir_text)
+        out["mtf_bias_color"] = out["mtf_avg"].apply(dir_color)
 
-        # ----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # 1H structural fib cloud
-        # ----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         struct_df = self._build_h1_structure_map(out)
         for col in ["h1_high", "h1_low", "fib618", "fib786", "zone_top", "zone_bottom"]:
             out[col] = struct_df[col]
 
-        out["in_structural_zone"] = (
-            out["close"] <= out["h1_high"]
-        ) & (
-            out["close"] >= out["h1_low"]
-        )
+        # Pine uses:
+        # inStructuralZone = close <= h1_high and close >= h1_low
+        out["in_structural_zone"] = (out["close"] <= out["h1_high"]) & (out["close"] >= out["h1_low"])
 
-        # ----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # Confluence aggregator
-        # ----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         out["is_confluent"] = (
             ((out["bull_count"] >= c.min_strength) | (out["bear_count"] >= c.min_strength))
             & out["vwap_confirm"]
@@ -317,6 +350,15 @@ class ConfluenceCloudEngine:
             ],
             [1, -1],
             default=0,
+        )
+
+        out["cc_direction"] = np.select(
+            [
+                out["cc_dir"] == 1,
+                out["cc_dir"] == -1,
+            ],
+            ["BULL", "BEAR"],
+            default="NEUTRAL",
         )
 
         agreement_strength = np.maximum(out["bull_count"], out["bear_count"]) / 6.0
@@ -376,68 +418,62 @@ class ConfluenceCloudEngine:
         zone_top = np.maximum(fib618, fib786)
         zone_bottom = np.minimum(fib618, fib786)
 
-        struct = pd.DataFrame({
-            "h1_high": h1_high,
-            "h1_low": h1_low,
-            "fib618": fib618,
-            "fib786": fib786,
-            "zone_top": zone_top,
-            "zone_bottom": zone_bottom,
-        }, index=rs.index)
+        struct = pd.DataFrame(
+            {
+                "h1_high": h1_high,
+                "h1_low": h1_low,
+                "fib618": fib618,
+                "fib786": fib786,
+                "zone_top": zone_top,
+                "zone_bottom": zone_bottom,
+            },
+            index=rs.index,
+        )
 
         return struct.reindex(df.index, method="ffill")
-
-    def _dir_text(self, v: float) -> str:
-        if v > 0.60:
-            return "STRONG BULL"
-        if v > 0.20:
-            return "BULL"
-        if v < -0.60:
-            return "STRONG BEAR"
-        if v < -0.20:
-            return "BEAR"
-        return "NEUTRAL"
 
     def latest(self, df: pd.DataFrame) -> ConfluenceCloudOutput:
         calc = self.calculate(df)
         row = calc.iloc[-1]
 
         return ConfluenceCloudOutput(
-            cc_is_confluent=bool(row["is_confluent"]),
-            cc_in_structural_zone=bool(row["in_structural_zone"]),
-            cc_active_zone=bool(row["cc_active_zone"]),
-            cc_dir=int(row["cc_dir"]),
-            cc_strength_score=float(row["cc_strength_score"]),
-            bull_count=int(row["bull_count"]),
-            bear_count=int(row["bear_count"]),
-            vwap_confirm=bool(row["vwap_confirm"]),
-            rsi_confirm=bool(row["rsi_confirm"]),
-            macd_confirm=bool(row["macd_confirm"]),
-            mtf_avg=float(row["mtf_avg"]),
+            cc_is_confluent=safe_bool(row["is_confluent"]),
+            cc_in_structural_zone=safe_bool(row["in_structural_zone"]),
+            cc_active_zone=safe_bool(row["cc_active_zone"]),
+            cc_dir=safe_int(row["cc_dir"]),
+            cc_direction=str(row["cc_direction"]),
+            cc_strength_score=safe_float(row["cc_strength_score"]),
+            bull_count=safe_int(row["bull_count"]),
+            bear_count=safe_int(row["bear_count"]),
+            vwap_confirm=safe_bool(row["vwap_confirm"]),
+            rsi_confirm=safe_bool(row["rsi_confirm"]),
+            macd_confirm=safe_bool(row["macd_confirm"]),
+            mtf_avg=safe_float(row["mtf_avg"]),
             mtf_bias=str(row["mtf_bias"]),
-            t1=int(row["t1"]),
-            t5=int(row["t5"]),
-            t15=int(row["t15"]),
-            t60=int(row["t60"]),
-            t240=int(row["t240"]),
-            tD=int(row["tD"]),
-            rsi_value=float(row["rsi_value"]),
-            vwap_value=None if pd.isna(row["vwap_value"]) else float(row["vwap_value"]),
-            macd_line=float(row["macd_line"]),
-            signal_line=float(row["signal_line"]),
-            h1_high=None if pd.isna(row["h1_high"]) else float(row["h1_high"]),
-            h1_low=None if pd.isna(row["h1_low"]) else float(row["h1_low"]),
-            fib618=None if pd.isna(row["fib618"]) else float(row["fib618"]),
-            fib786=None if pd.isna(row["fib786"]) else float(row["fib786"]),
-            zone_top=None if pd.isna(row["zone_top"]) else float(row["zone_top"]),
-            zone_bottom=None if pd.isna(row["zone_bottom"]) else float(row["zone_bottom"]),
+            mtf_bias_color=str(row["mtf_bias_color"]),
+            t1=safe_int(row["t1"]),
+            t5=safe_int(row["t5"]),
+            t15=safe_int(row["t15"]),
+            t60=safe_int(row["t60"]),
+            t240=safe_int(row["t240"]),
+            tD=safe_int(row["tD"]),
+            rsi_value=safe_float(row["rsi_value"], 50.0),
+            vwap_value=safe_optional_float(row["vwap_value"]),
+            macd_line=safe_float(row["macd_line"]),
+            signal_line=safe_float(row["signal_line"]),
+            h1_high=safe_optional_float(row["h1_high"]),
+            h1_low=safe_optional_float(row["h1_low"]),
+            fib618=safe_optional_float(row["fib618"]),
+            fib786=safe_optional_float(row["fib786"]),
+            zone_top=safe_optional_float(row["zone_top"]),
+            zone_bottom=safe_optional_float(row["zone_bottom"]),
             timestamp=calc.index[-1],
         )
 
 
-# ==============================================================================
-# PUBLIC API
-# ==============================================================================
+# =============================================================================
+# PUBLIC ENGINE API
+# =============================================================================
 
 def run_confluence_cloud_engine(
     df: pd.DataFrame,
@@ -448,74 +484,66 @@ def run_confluence_cloud_engine(
     return asdict(latest)
 
 
-# ==============================================================================
-# DIRECT TEST BLOCK
-# ==============================================================================
+# =============================================================================
+# WEBSITE PAYLOAD BUILDER
+# =============================================================================
 
-if __name__ == "__main__":
-    np.random.seed(42)
-
-    periods = 1800
-    idx = pd.date_range("2026-01-01", periods=periods, freq="1min")
-
-    base = 100 + np.cumsum(np.random.normal(0, 0.08, periods))
-    close = pd.Series(base, index=idx)
-    open_ = close.shift(1).fillna(close.iloc[0])
-    high = np.maximum(open_, close) + np.random.uniform(0.01, 0.12, periods)
-    low = np.minimum(open_, close) - np.random.uniform(0.01, 0.12, periods)
-    volume = np.random.randint(100, 1000, periods)
-
-    for k in [250, 800, 1200]:
-        if k + 80 < periods:
-            close.iloc[k:k + 80] += np.linspace(0.0, 3.0, 80)
-            high.iloc[k:k + 80] = np.maximum(high.iloc[k:k + 80], close.iloc[k:k + 80] + 0.05)
-
-    for k in [500, 1450]:
-        if k + 70 < periods:
-            close.iloc[k:k + 70] -= np.linspace(0.0, 2.5, 70)
-            low.iloc[k:k + 70] = np.minimum(low.iloc[k:k + 70], close.iloc[k:k + 70] - 0.05)
-
-    test_df = pd.DataFrame(
-        {
-            "open": open_.values,
-            "high": high.values,
-            "low": low.values,
-            "close": close.values,
-            "volume": volume,
-        },
-        index=idx,
-    )
-
-    config = ConfluenceCloudConfig(
-        min_strength=4,
-        w1=1.0,
-        w5=1.0,
-        w15=1.0,
-        w60=1.0,
-        w240=1.0,
-        wD=1.0,
-    )
-
+def build_confluence_cloud_latest_payload(
+    df: pd.DataFrame,
+    config: Optional[ConfluenceCloudConfig] = None,
+) -> Dict[str, Any]:
     engine = ConfluenceCloudEngine(config=config)
-    full = engine.calculate(test_df)
-    latest = engine.latest(test_df)
+    latest = engine.latest(df)
 
-    print("\n=== SMARTCHART CONFLUENCE CLOUD TEST ===")
-    print(
-        full[
-            [
-                "is_confluent",
-                "in_structural_zone",
-                "cc_active_zone",
-                "cc_dir",
-                "cc_strength_score",
-                "bull_count",
-                "bear_count",
-                "mtf_avg",
-                "mtf_bias",
-            ]
-        ].tail(15)
-    )
+    zone_ready = latest.zone_top is not None and latest.zone_bottom is not None
 
-    print("\n=== LATEST OUTPUT ===")
-    print(asdict(latest))
+    payload = {
+        "indicator": "confluence_cloud",
+        "debug_version": "confluence_cloud_payload_v1",
+        "timestamp": str(latest.timestamp),
+
+        "state": {
+            "is_confluent": latest.cc_is_confluent,
+            "in_structural_zone": latest.cc_in_structural_zone,
+            "active_zone": latest.cc_active_zone,
+            "direction": latest.cc_direction,
+            "dir_value": latest.cc_dir,
+            "strength_score": round(latest.cc_strength_score, 4),
+        },
+
+        "mtf": {
+            "average": round(latest.mtf_avg, 4),
+            "bias": latest.mtf_bias,
+            "bias_color": latest.mtf_bias_color,
+            "bull_count": latest.bull_count,
+            "bear_count": latest.bear_count,
+            "t1": latest.t1,
+            "t5": latest.t5,
+            "t15": latest.t15,
+            "t60": latest.t60,
+            "t240": latest.t240,
+            "tD": latest.tD,
+        },
+
+        "confirmations": {
+            "vwap_confirm": latest.vwap_confirm,
+            "rsi_confirm": latest.rsi_confirm,
+            "macd_confirm": latest.macd_confirm,
+            "rsi_value": round(latest.rsi_value, 4),
+            "vwap_value": None if latest.vwap_value is None else round(latest.vwap_value, 4),
+            "macd_line": round(latest.macd_line, 6),
+            "signal_line": round(latest.signal_line, 6),
+        },
+
+        "structure": {
+            "h1_high": None if latest.h1_high is None else round(latest.h1_high, 4),
+            "h1_low": None if latest.h1_low is None else round(latest.h1_low, 4),
+            "fib618": None if latest.fib618 is None else round(latest.fib618, 4),
+            "fib786": None if latest.fib786 is None else round(latest.fib786, 4),
+            "zone_top": None if latest.zone_top is None else round(latest.zone_top, 4),
+            "zone_bottom": None if latest.zone_bottom is None else round(latest.zone_bottom, 4),
+            "zone_ready": zone_ready,
+        },
+    }
+
+    return payload

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -13,7 +13,6 @@ import pandas as pd
 # =============================================================================
 
 DEFAULT_SESSION_DAILY_CONFIG: Dict[str, Any] = {
-    # Sessions
     "session_timezone": "Europe/London",
 
     # Session windows
@@ -29,6 +28,24 @@ DEFAULT_SESSION_DAILY_CONFIG: Dict[str, Any] = {
 # =============================================================================
 # HELPERS
 # =============================================================================
+
+def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return int(value)
+    except Exception:
+        return default
+
 
 def _to_local_index(index: pd.DatetimeIndex, tz_name: str) -> pd.DatetimeIndex:
     """
@@ -254,7 +271,7 @@ def _daily_levels_from_intraday(
 
 def _session_text(asia_in: pd.Series, london_in: pd.Series, ny_in: pd.Series) -> pd.Series:
     """
-    Pine parity for table session text:
+    Pine parity:
       ASIA / LONDON / NEW YORK / NONE
     """
     out = pd.Series("NONE", index=asia_in.index, dtype=object)
@@ -262,6 +279,123 @@ def _session_text(asia_in: pd.Series, london_in: pd.Series, ny_in: pd.Series) ->
     out.loc[london_in.astype(bool)] = "LONDON"
     out.loc[ny_in.astype(bool)] = "NEW YORK"
     return out
+
+
+def _price_vs_level(price: Optional[float], level: Optional[float]) -> Optional[str]:
+    if price is None or level is None:
+        return None
+    if price > level:
+        return "above"
+    if price < level:
+        return "below"
+    return "at"
+
+
+def _make_level(
+    key: str,
+    label: str,
+    value: Optional[float],
+    price: Optional[float],
+    touched: Optional[int] = None,
+    category: Optional[str] = None,
+    color_hint: Optional[str] = None,
+    visible_default: bool = True,
+) -> Dict[str, Any]:
+    return {
+        "key": key,
+        "label": label,
+        "value": value,
+        "price_relation": _price_vs_level(price, value),
+        "touched_now": bool(touched) if touched is not None else None,
+        "category": category,
+        "color_hint": color_hint,
+        "visible_default": visible_default,
+    }
+
+
+def _collect_visible_levels(row: pd.Series, current_price: Optional[float]) -> List[Dict[str, Any]]:
+    """
+    Lean live-visibility layer for future website/chart usage.
+    Keeps the payload rich, but flags only the most useful live levels.
+    """
+    levels: List[Dict[str, Any]] = []
+
+    session_text = row.get("sc_session_text", "NONE")
+
+    # Previous day levels are always useful
+    levels.append(_make_level(
+        "prev_day_high", "Prev Day High",
+        _safe_float(row.get("sc_prev_day_high")),
+        current_price,
+        _safe_int(row.get("sc_touch_prev_day_high")),
+        "previous_day", "red", True
+    ))
+    levels.append(_make_level(
+        "prev_day_mid", "Prev Day Mid",
+        _safe_float(row.get("sc_prev_day_mid")),
+        current_price,
+        _safe_int(row.get("sc_touch_prev_day_mid")),
+        "previous_day", "orange", True
+    ))
+    levels.append(_make_level(
+        "prev_day_low", "Prev Day Low",
+        _safe_float(row.get("sc_prev_day_low")),
+        current_price,
+        _safe_int(row.get("sc_touch_prev_day_low")),
+        "previous_day", "green", True
+    ))
+
+    if session_text == "ASIA":
+        levels.extend([
+            _make_level("asia_cur_hi", "Asia Current High", _safe_float(row.get("sc_asia_cur_hi")), current_price, None, "session_current", "aqua", True),
+            _make_level("asia_cur_lo", "Asia Current Low", _safe_float(row.get("sc_asia_cur_lo")), current_price, None, "session_current", "aqua", True),
+            _make_level("asia_or5_hi", "Asia OR5 High", _safe_float(row.get("sc_asia_or5_hi")), current_price, _safe_int(row.get("sc_touch_asia_or5_hi")), "opening_range", "aqua", True),
+            _make_level("asia_or5_lo", "Asia OR5 Low", _safe_float(row.get("sc_asia_or5_lo")), current_price, _safe_int(row.get("sc_touch_asia_or5_lo")), "opening_range", "aqua", True),
+            _make_level("asia_or15_hi", "Asia OR15 High", _safe_float(row.get("sc_asia_or15_hi")), current_price, _safe_int(row.get("sc_touch_asia_or15_hi")), "opening_range", "blue", True),
+            _make_level("asia_or15_lo", "Asia OR15 Low", _safe_float(row.get("sc_asia_or15_lo")), current_price, _safe_int(row.get("sc_touch_asia_or15_lo")), "opening_range", "blue", True),
+        ])
+    else:
+        levels.extend([
+            _make_level("prev_asia_hi", "Prev Asia High", _safe_float(row.get("sc_prev_asia_hi")), current_price, _safe_int(row.get("sc_touch_prev_asia_hi")), "session_previous", "aqua", True),
+            _make_level("prev_asia_lo", "Prev Asia Low", _safe_float(row.get("sc_prev_asia_lo")), current_price, _safe_int(row.get("sc_touch_prev_asia_lo")), "session_previous", "aqua", True),
+        ])
+
+    if session_text == "LONDON":
+        levels.extend([
+            _make_level("london_cur_hi", "London Current High", _safe_float(row.get("sc_london_cur_hi")), current_price, None, "session_current", "lime", True),
+            _make_level("london_cur_lo", "London Current Low", _safe_float(row.get("sc_london_cur_lo")), current_price, None, "session_current", "lime", True),
+            _make_level("london_or5_hi", "London OR5 High", _safe_float(row.get("sc_london_or5_hi")), current_price, _safe_int(row.get("sc_touch_london_or5_hi")), "opening_range", "lime", True),
+            _make_level("london_or5_lo", "London OR5 Low", _safe_float(row.get("sc_london_or5_lo")), current_price, _safe_int(row.get("sc_touch_london_or5_lo")), "opening_range", "lime", True),
+            _make_level("london_or15_hi", "London OR15 High", _safe_float(row.get("sc_london_or15_hi")), current_price, _safe_int(row.get("sc_touch_london_or15_hi")), "opening_range", "green", True),
+            _make_level("london_or15_lo", "London OR15 Low", _safe_float(row.get("sc_london_or15_lo")), current_price, _safe_int(row.get("sc_touch_london_or15_lo")), "opening_range", "green", True),
+        ])
+    else:
+        levels.extend([
+            _make_level("prev_london_hi", "Prev London High", _safe_float(row.get("sc_prev_london_hi")), current_price, _safe_int(row.get("sc_touch_prev_london_hi")), "session_previous", "lime", True),
+            _make_level("prev_london_lo", "Prev London Low", _safe_float(row.get("sc_prev_london_lo")), current_price, _safe_int(row.get("sc_touch_prev_london_lo")), "session_previous", "lime", True),
+        ])
+
+    if session_text == "NEW YORK":
+        levels.extend([
+            _make_level("ny_cur_hi", "NY Current High", _safe_float(row.get("sc_ny_cur_hi")), current_price, None, "session_current", "fuchsia", True),
+            _make_level("ny_cur_lo", "NY Current Low", _safe_float(row.get("sc_ny_cur_lo")), current_price, None, "session_current", "fuchsia", True),
+            _make_level("ny_or5_hi", "NY OR5 High", _safe_float(row.get("sc_ny_or5_hi")), current_price, _safe_int(row.get("sc_touch_ny_or5_hi")), "opening_range", "fuchsia", True),
+            _make_level("ny_or5_lo", "NY OR5 Low", _safe_float(row.get("sc_ny_or5_lo")), current_price, _safe_int(row.get("sc_touch_ny_or5_lo")), "opening_range", "fuchsia", True),
+            _make_level("ny_or15_hi", "NY OR15 High", _safe_float(row.get("sc_ny_or15_hi")), current_price, _safe_int(row.get("sc_touch_ny_or15_hi")), "opening_range", "red", True),
+            _make_level("ny_or15_lo", "NY OR15 Low", _safe_float(row.get("sc_ny_or15_lo")), current_price, _safe_int(row.get("sc_touch_ny_or15_lo")), "opening_range", "red", True),
+        ])
+    else:
+        levels.extend([
+            _make_level("prev_ny_hi", "Prev NY High", _safe_float(row.get("sc_prev_ny_hi")), current_price, _safe_int(row.get("sc_touch_prev_ny_hi")), "session_previous", "fuchsia", True),
+            _make_level("prev_ny_lo", "Prev NY Low", _safe_float(row.get("sc_prev_ny_lo")), current_price, _safe_int(row.get("sc_touch_prev_ny_lo")), "session_previous", "fuchsia", True),
+        ])
+
+    clean_levels = []
+    for level in levels:
+        if level["value"] is not None:
+            clean_levels.append(level)
+
+    return clean_levels
 
 
 # =============================================================================
@@ -492,62 +626,129 @@ def run_session_daily_engine(
 
 
 # =============================================================================
-# TEST BLOCK
+# PAYLOAD BUILDER
 # =============================================================================
 
-if __name__ == "__main__":
-    n = 3 * 24 * 60  # 3 days of 1m bars
-    idx = pd.date_range("2026-04-08 00:00:00", periods=n, freq="1min", tz="UTC")
+def build_session_daily_latest_payload(
+    df: pd.DataFrame,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Single source of truth for website JSON.
+    Keeps full backend detail while also exposing a lean live-visibility layer.
+    """
+    engine = compute_session_daily_engine(df, config=config)
+    if engine.empty:
+        raise ValueError("Session/Daily build error: empty engine output")
 
-    x = np.arange(n)
-    base = 4800 + np.sin(x / 30.0) * 8 + np.sin(x / 200.0) * 20
+    row = engine.iloc[-1]
+    ts = engine.index[-1]
 
-    df = pd.DataFrame(
-        {
-            "open": base + np.sin(x / 13.0) * 0.8,
-            "high": base + 1.2 + np.sin(x / 11.0) * 0.9,
-            "low": base - 1.2 + np.sin(x / 17.0) * 0.9,
-            "close": base + np.sin(x / 15.0) * 0.7,
-            "volume": 1000 + (np.sin(x / 9.0) * 120),
+    current_price = _safe_float(row.get("close"))
+    active_session = str(row.get("sc_session_text", "NONE"))
+
+    payload: Dict[str, Any] = {
+        "indicator": "session_daily",
+        "name": "SmartChart Session & Daily",
+        "debug_version": "session_daily_payload_v1",
+        "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+        "session_timezone": (config or {}).get("session_timezone", DEFAULT_SESSION_DAILY_CONFIG["session_timezone"]),
+        "current_price": current_price,
+
+        "state": {
+            "active_session": active_session,
+            "asia_in": bool(_safe_int(row.get("sc_asia_in"))),
+            "london_in": bool(_safe_int(row.get("sc_london_in"))),
+            "newyork_in": bool(_safe_int(row.get("sc_ny_in"))),
+            "asia_start": bool(_safe_int(row.get("sc_asia_start"))),
+            "london_start": bool(_safe_int(row.get("sc_london_start"))),
+            "newyork_start": bool(_safe_int(row.get("sc_ny_start"))),
+            "asia_end": bool(_safe_int(row.get("sc_asia_end"))),
+            "london_end": bool(_safe_int(row.get("sc_london_end"))),
+            "newyork_end": bool(_safe_int(row.get("sc_ny_end"))),
+            "day_key": row.get("sc_day_key"),
         },
-        index=idx,
-    )
 
-    result = run_session_daily_engine(df)
+        "previous_day": {
+            "high": _safe_float(row.get("sc_prev_day_high")),
+            "low": _safe_float(row.get("sc_prev_day_low")),
+            "mid": _safe_float(row.get("sc_prev_day_mid")),
+            "touch_high": bool(_safe_int(row.get("sc_touch_prev_day_high"))),
+            "touch_low": bool(_safe_int(row.get("sc_touch_prev_day_low"))),
+            "touch_mid": bool(_safe_int(row.get("sc_touch_prev_day_mid"))),
+        },
 
-    cols = [
-        "sc_asia_in",
-        "sc_london_in",
-        "sc_ny_in",
-        "sc_asia_start",
-        "sc_london_start",
-        "sc_ny_start",
-        "sc_prev_day_high",
-        "sc_prev_day_low",
-        "sc_prev_day_mid",
-        "sc_prev_asia_hi",
-        "sc_prev_asia_lo",
-        "sc_prev_london_hi",
-        "sc_prev_london_lo",
-        "sc_prev_ny_hi",
-        "sc_prev_ny_lo",
-        "sc_asia_or5_hi",
-        "sc_asia_or5_lo",
-        "sc_asia_or15_hi",
-        "sc_asia_or15_lo",
-        "sc_london_or5_hi",
-        "sc_london_or5_lo",
-        "sc_london_or15_hi",
-        "sc_london_or15_lo",
-        "sc_ny_or5_hi",
-        "sc_ny_or5_lo",
-        "sc_ny_or15_hi",
-        "sc_ny_or15_lo",
-        "sc_touch_prev_day_high",
-        "sc_touch_prev_day_low",
-        "sc_touch_prev_day_mid",
-        "sc_session_text",
-    ]
+        "sessions": {
+            "asia": {
+                "current_high": _safe_float(row.get("sc_asia_cur_hi")),
+                "current_low": _safe_float(row.get("sc_asia_cur_lo")),
+                "previous_high": _safe_float(row.get("sc_prev_asia_hi")),
+                "previous_low": _safe_float(row.get("sc_prev_asia_lo")),
+                "touch_previous_high": bool(_safe_int(row.get("sc_touch_prev_asia_hi"))),
+                "touch_previous_low": bool(_safe_int(row.get("sc_touch_prev_asia_lo"))),
+                "or5_high": _safe_float(row.get("sc_asia_or5_hi")),
+                "or5_low": _safe_float(row.get("sc_asia_or5_lo")),
+                "or15_high": _safe_float(row.get("sc_asia_or15_hi")),
+                "or15_low": _safe_float(row.get("sc_asia_or15_lo")),
+                "touch_or5_high": bool(_safe_int(row.get("sc_touch_asia_or5_hi"))),
+                "touch_or5_low": bool(_safe_int(row.get("sc_touch_asia_or5_lo"))),
+                "touch_or15_high": bool(_safe_int(row.get("sc_touch_asia_or15_hi"))),
+                "touch_or15_low": bool(_safe_int(row.get("sc_touch_asia_or15_lo"))),
+            },
+            "london": {
+                "current_high": _safe_float(row.get("sc_london_cur_hi")),
+                "current_low": _safe_float(row.get("sc_london_cur_lo")),
+                "previous_high": _safe_float(row.get("sc_prev_london_hi")),
+                "previous_low": _safe_float(row.get("sc_prev_london_lo")),
+                "touch_previous_high": bool(_safe_int(row.get("sc_touch_prev_london_hi"))),
+                "touch_previous_low": bool(_safe_int(row.get("sc_touch_prev_london_lo"))),
+                "or5_high": _safe_float(row.get("sc_london_or5_hi")),
+                "or5_low": _safe_float(row.get("sc_london_or5_lo")),
+                "or15_high": _safe_float(row.get("sc_london_or15_hi")),
+                "or15_low": _safe_float(row.get("sc_london_or15_lo")),
+                "touch_or5_high": bool(_safe_int(row.get("sc_touch_london_or5_hi"))),
+                "touch_or5_low": bool(_safe_int(row.get("sc_touch_london_or5_lo"))),
+                "touch_or15_high": bool(_safe_int(row.get("sc_touch_london_or15_hi"))),
+                "touch_or15_low": bool(_safe_int(row.get("sc_touch_london_or15_lo"))),
+            },
+            "newyork": {
+                "current_high": _safe_float(row.get("sc_ny_cur_hi")),
+                "current_low": _safe_float(row.get("sc_ny_cur_lo")),
+                "previous_high": _safe_float(row.get("sc_prev_ny_hi")),
+                "previous_low": _safe_float(row.get("sc_prev_ny_lo")),
+                "touch_previous_high": bool(_safe_int(row.get("sc_touch_prev_ny_hi"))),
+                "touch_previous_low": bool(_safe_int(row.get("sc_touch_prev_ny_lo"))),
+                "or5_high": _safe_float(row.get("sc_ny_or5_hi")),
+                "or5_low": _safe_float(row.get("sc_ny_or5_lo")),
+                "or15_high": _safe_float(row.get("sc_ny_or15_hi")),
+                "or15_low": _safe_float(row.get("sc_ny_or15_lo")),
+                "touch_or5_high": bool(_safe_int(row.get("sc_touch_ny_or5_hi"))),
+                "touch_or5_low": bool(_safe_int(row.get("sc_touch_ny_or5_lo"))),
+                "touch_or15_high": bool(_safe_int(row.get("sc_touch_ny_or15_hi"))),
+                "touch_or15_low": bool(_safe_int(row.get("sc_touch_ny_or15_lo"))),
+            },
+        },
 
-    print("SmartChart Session & Daily Engine — Pine parity rebuild")
-    print(result[cols].tail(40))
+        # Full raw live levels for chart/website layer to decide visibility
+        "live_levels": _collect_visible_levels(row, current_price),
+
+        # Future website/live-chart visibility policy layer
+        "visibility": {
+            "mode": "lean_live_chart",
+            "show_current_price": True,
+            "show_previous_day_levels": True,
+            "show_active_session_current_range": True,
+            "show_previous_session_levels_when_inactive": True,
+            "show_opening_ranges": True,
+            "show_touch_flags": True,
+            "show_all_raw_levels_by_default": False,
+            "notes": (
+                "Payload keeps full session/daily state, but live chart visibility "
+                "should stay selective so the website visual does not become overwhelming."
+            ),
+        },
+
+        "status": "live",
+    }
+
+    return payload

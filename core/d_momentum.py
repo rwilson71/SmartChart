@@ -1,28 +1,3 @@
-"""
-SmartChart Backend — d_momentum.py
-
-AI / Momentum Bias Module v2
-Clean Python rebuild from Pine parity reference.
-
-Parity blocks:
-- Core inputs and helpers
-- RSI / EMA momentum / signal / base EMA series
-- Component state engine
-- Score engine
-- OB / OS stretch layer
-- Raw bias classification
-- Composite AI state classification
-- Memory / hold / refresh logic
-- Event pulse engine
-- Export-ready output contract
-- Clean standalone test block
-
-Backend only:
-- no TradingView visuals
-- no labels / plots / drawing objects
-- designed for later parity validation
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
@@ -48,9 +23,9 @@ except Exception:
 
         def rsi(series: pd.Series, length: int = 14) -> pd.Series:
             """
-            Wilder-style RSI with TradingView-friendly edge-case behavior.
+            Wilder-style RSI with TradingView-friendly edge-case handling.
 
-            Edge-case handling:
+            Edge cases:
             - avg_gain == 0 and avg_loss == 0 -> 50
             - avg_loss == 0 and avg_gain > 0 -> 100
             - avg_gain == 0 and avg_loss > 0 -> 0
@@ -122,14 +97,11 @@ def _clamp(series: pd.Series, lo: float, hi: float) -> pd.Series:
 
 def _bars_since_change(series: pd.Series) -> pd.Series:
     """
-    Pine parity helper for:
+    Pine-style helper for:
         ta.barssince(x != x[1])
 
-    This returns the count of consecutive bars for which the value
-    has remained unchanged.
-
-    Pine behavior in this use:
-    - change on current bar -> 0
+    Behavior:
+    - changed on current bar -> 0
     - unchanged next bar -> 1
     - unchanged next bar -> 2
     """
@@ -152,16 +124,90 @@ def _bars_since_change(series: pd.Series) -> pd.Series:
     return pd.Series(out, index=series.index)
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or pd.isna(v):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None or pd.isna(v):
+            return default
+        return int(v)
+    except Exception:
+        return default
+
+
+def _safe_str(v: Any, default: str = "-") -> str:
+    try:
+        if v is None:
+            return default
+        if isinstance(v, float) and np.isnan(v):
+            return default
+        s = str(v).strip()
+        return s if s else default
+    except Exception:
+        return default
+
+
+def _state_text(v: int) -> str:
+    mapping = {
+        5: "STRONG BULL + EXT OB",
+        4: "BULL + OB",
+        3: "STRONG BULL",
+        2: "BULL",
+        1: "WEAK BULL",
+        0: "NEUTRAL",
+        -1: "WEAK BEAR",
+        -2: "BEAR",
+        -3: "STRONG BEAR",
+        -4: "BEAR + OS",
+        -5: "STRONG BEAR + EXT OS",
+    }
+    return mapping.get(int(v), "NEUTRAL")
+
+
+def _dir_text(v: int) -> str:
+    if int(v) > 0:
+        return "BULL"
+    if int(v) < 0:
+        return "BEAR"
+    return "NEUTRAL"
+
+
+def _obos_text(v: int) -> str:
+    mapping = {
+        2: "EXT OB",
+        1: "OB",
+        0: "NEUTRAL",
+        -1: "OS",
+        -2: "EXT OS",
+    }
+    return mapping.get(int(v), "NEUTRAL")
+
+
+def _direction_color(v: int) -> str:
+    if int(v) > 0:
+        return "#22c55e"
+    if int(v) < 0:
+        return "#ef4444"
+    return "#9ca3af"
+
+
 # =============================================================================
-# CORE ENGINE
+# MAIN ENGINE
 # =============================================================================
 
-def run_momentum_module(
+def build_momentum(
     df: pd.DataFrame,
     config: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """
-    Clean SmartChart AI / Momentum Bias backend module.
+    SmartChart AI / Momentum Bias module.
 
     Required columns:
     - close
@@ -170,20 +216,20 @@ def run_momentum_module(
     - open, high, low, volume
 
     Returns:
-    DataFrame with all module fields appended.
+    DataFrame with all momentum fields appended.
     """
     if df is None or df.empty:
         return pd.DataFrame()
 
     if "close" not in df.columns:
-        raise ValueError("run_momentum_module() requires a DataFrame with a 'close' column.")
+        raise ValueError("build_momentum() requires a DataFrame with a 'close' column.")
 
-    cfg_raw = MomentumConfig()
+    cfg_obj = MomentumConfig()
     if config:
         for k, v in config.items():
-            if hasattr(cfg_raw, k):
-                setattr(cfg_raw, k, v)
-    cfg = cfg_raw
+            if hasattr(cfg_obj, k):
+                setattr(cfg_obj, k, v)
+    cfg = cfg_obj
 
     out = df.copy()
     close = out["close"].astype(float)
@@ -273,12 +319,6 @@ def run_momentum_module(
 
     # =========================================================================
     # OB / OS LAYER
-    #
-    #  2  = Extreme Overbought
-    #  1  = Overbought
-    #  0  = Neutral
-    # -1  = Oversold
-    # -2  = Extreme Oversold
     # =========================================================================
 
     raw_stretch = np.select(
@@ -288,21 +328,16 @@ def run_momentum_module(
             out["mom_rsi"] <= cfg.ext_os_level,
             out["mom_rsi"] <= cfg.os_level,
         ],
-        [
-            2,
-            1,
-            -2,
-            -1,
-        ],
+        [2, 1, -2, -1],
         default=0,
     )
 
     out["mom_raw_stretch_state"] = pd.Series(raw_stretch, index=out.index).astype(int)
-
-    if cfg.use_obos_filter:
-        out["mom_ob_state"] = out["mom_raw_stretch_state"].astype(int)
-    else:
-        out["mom_ob_state"] = pd.Series(0, index=out.index, dtype=int)
+    out["mom_ob_state"] = (
+        out["mom_raw_stretch_state"].astype(int)
+        if cfg.use_obos_filter
+        else pd.Series(0, index=out.index, dtype=int)
+    )
 
     out["mom_is_overbought"] = (out["mom_ob_state"] == 1).astype(int)
     out["mom_is_extreme_overbought"] = (out["mom_ob_state"] == 2).astype(int)
@@ -311,14 +346,6 @@ def run_momentum_module(
 
     # =========================================================================
     # RAW BIAS CLASSIFICATION
-    #
-    #  3  = Strong Bull
-    #  2  = Bull
-    #  1  = Weak Bull
-    #  0  = Neutral
-    # -1  = Weak Bear
-    # -2  = Bear
-    # -3  = Strong Bear
     # =========================================================================
 
     raw_bias_state = np.select(
@@ -339,18 +366,6 @@ def run_momentum_module(
 
     # =========================================================================
     # COMPOSITE AI STATE
-    #
-    #  5  = Strong Bull + Extreme Overbought
-    #  4  = Bull + Overbought
-    #  3  = Strong Bull
-    #  2  = Bull
-    #  1  = Weak Bull
-    #  0  = Neutral
-    # -1  = Weak Bear
-    # -2  = Bear
-    # -3  = Strong Bear
-    # -4  = Bear + Oversold
-    # -5  = Strong Bear + Extreme Oversold
     # =========================================================================
 
     raw_ai_state = np.select(
@@ -432,19 +447,15 @@ def run_momentum_module(
     out["sc_mom_bull_weak_pulse"] = (
         (out["sc_mom_state_changed"] == 1) & (out["sc_mom_ai_state"] == 1)
     ).astype(int)
-
     out["sc_mom_bull_pulse"] = (
         (out["sc_mom_state_changed"] == 1) & (out["sc_mom_ai_state"] == 2)
     ).astype(int)
-
     out["sc_mom_bull_strong_pulse"] = (
         (out["sc_mom_state_changed"] == 1) & (out["sc_mom_ai_state"] == 3)
     ).astype(int)
-
     out["sc_mom_bull_ob_pulse"] = (
         (out["sc_mom_state_changed"] == 1) & (out["sc_mom_ai_state"] == 4)
     ).astype(int)
-
     out["sc_mom_bull_ext_ob_pulse"] = (
         (out["sc_mom_state_changed"] == 1) & (out["sc_mom_ai_state"] == 5)
     ).astype(int)
@@ -452,25 +463,21 @@ def run_momentum_module(
     out["sc_mom_bear_weak_pulse"] = (
         (out["sc_mom_state_changed"] == 1) & (out["sc_mom_ai_state"] == -1)
     ).astype(int)
-
     out["sc_mom_bear_pulse"] = (
         (out["sc_mom_state_changed"] == 1) & (out["sc_mom_ai_state"] == -2)
     ).astype(int)
-
     out["sc_mom_bear_strong_pulse"] = (
         (out["sc_mom_state_changed"] == 1) & (out["sc_mom_ai_state"] == -3)
     ).astype(int)
-
     out["sc_mom_bear_os_pulse"] = (
         (out["sc_mom_state_changed"] == 1) & (out["sc_mom_ai_state"] == -4)
     ).astype(int)
-
     out["sc_mom_bear_ext_os_pulse"] = (
         (out["sc_mom_state_changed"] == 1) & (out["sc_mom_ai_state"] == -5)
     ).astype(int)
 
     # =========================================================================
-    # EXPORT-READY FIELDS
+    # EXPORT FIELDS
     # =========================================================================
 
     out["sc_mom_state"] = out["sc_mom_ai_state"].astype(int)
@@ -500,74 +507,111 @@ def run_momentum_module(
     out["sc_mom_hist_line"] = out["mom_hist_line"].astype(float)
     out["sc_mom_dist_base_pct"] = out["mom_dist_base_pct"].astype(float)
 
+    # Internal parity fields kept available
+    out["sc_mom_raw_bias_state"] = out["mom_raw_bias_state"].astype(int)
+    out["sc_mom_raw_bias_dir"] = out["mom_raw_bias_dir"].astype(int)
+    out["sc_mom_raw_ai_state"] = out["mom_raw_ai_state"].astype(int)
+    out["sc_mom_raw_ai_dir"] = out["mom_raw_ai_dir"].astype(int)
+    out["sc_mom_state_ready"] = out["mom_state_ready"].astype(int)
+    out["sc_mom_bias_ready"] = out["mom_bias_ready"].astype(int)
+    out["sc_mom_raw_stable_bars"] = out["mom_raw_stable_bars"].astype(float)
+    out["sc_mom_bias_stable_bars"] = out["mom_bias_stable_bars"].astype(float)
+
     # =========================================================================
-    # TEXT MAPPING
+    # TEXT FIELDS
     # =========================================================================
 
-    state_text_map = {
-        5: "STRONG BULL + EXT OB",
-        4: "BULL + OB",
-        3: "STRONG BULL",
-        2: "BULL",
-        1: "WEAK BULL",
-        0: "NEUTRAL",
-        -1: "WEAK BEAR",
-        -2: "BEAR",
-        -3: "STRONG BEAR",
-        -4: "BEAR + OS",
-        -5: "STRONG BEAR + EXT OS",
-    }
-
-    dir_text_map = {
-        1: "BULL",
-        0: "NEUTRAL",
-        -1: "BEAR",
-    }
-
-    obos_text_map = {
-        2: "EXT OB",
-        1: "OB",
-        0: "NEUTRAL",
-        -1: "OS",
-        -2: "EXT OS",
-    }
-
-    out["sc_mom_state_text"] = out["sc_mom_state"].map(state_text_map).fillna("NEUTRAL")
-    out["sc_mom_dir_text"] = out["sc_mom_dir"].map(dir_text_map).fillna("NEUTRAL")
-    out["sc_mom_obos_text"] = out["sc_mom_ob_state"].map(obos_text_map).fillna("NEUTRAL")
+    out["sc_mom_state_text"] = out["sc_mom_state"].map(_state_text).fillna("NEUTRAL")
+    out["sc_mom_dir_text"] = out["sc_mom_dir"].map(_dir_text).fillna("NEUTRAL")
+    out["sc_mom_obos_text"] = out["sc_mom_ob_state"].map(_obos_text).fillna("NEUTRAL")
 
     return out
 
 
 # =============================================================================
-# PUBLIC CONTRACT WRAPPER
+# PUBLIC WRAPPER
 # =============================================================================
 
 def run_d_momentum(
     df: pd.DataFrame,
     config: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
-    return run_momentum_module(df=df, config=config)
+    return build_momentum(df=df, config=config)
 
-import pandas as pd
-from core.d_momentum import run_d_momentum
 
-# LOAD REAL DATA
-df = pd.read_csv("data/xauusd_m1_full.csv")
+# =============================================================================
+# WEBSITE / CACHE PAYLOAD BUILDER
+# =============================================================================
 
-# Ensure datetime index (IMPORTANT)
-df["datetime"] = pd.to_datetime(df["datetime"])
-df.set_index("datetime", inplace=True)
+def build_momentum_latest_payload(
+    df: pd.DataFrame,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    out = build_momentum(df=df, config=config)
 
-# Run module
-result = run_d_momentum(df)
+    if out.empty:
+        return {
+            "debug_version": "momentum_payload_v1",
+            "status": "empty",
+        }
 
-print(result[[
-    "close",
-    "sc_mom_state",
-    "sc_mom_dir",
-    "sc_mom_ob_state",
-    "sc_mom_bull_score",
-    "sc_mom_bear_score",
-    "sc_mom_score_diff"
-]].tail(20))
+    last = out.iloc[-1]
+    ts = out.index[-1]
+
+    state = _safe_int(last.get("sc_mom_state", 0))
+    direction = _safe_int(last.get("sc_mom_dir", 0))
+    ob_state = _safe_int(last.get("sc_mom_ob_state", 0))
+
+    payload: Dict[str, Any] = {
+        "debug_version": "momentum_payload_v1",
+        "status": "ok",
+        "symbol": "XAUUSD",
+        "timestamp": str(ts),
+
+        "state": state,
+        "state_text": _state_text(state),
+
+        "direction": _dir_text(direction),
+        "direction_value": direction,
+        "direction_color": _direction_color(direction),
+
+        "ob_state": ob_state,
+        "obos_text": _obos_text(ob_state),
+
+        "bull_score": round(_safe_float(last.get("sc_mom_bull_score", 0.0)), 4),
+        "bear_score": round(_safe_float(last.get("sc_mom_bear_score", 0.0)), 4),
+        "score_diff": round(_safe_float(last.get("sc_mom_score_diff", 0.0)), 4),
+
+        "rsi": round(_safe_float(last.get("sc_mom_rsi", 0.0)), 4),
+        "momentum_line": round(_safe_float(last.get("sc_mom_line", 0.0)), 6),
+        "signal_line": round(_safe_float(last.get("sc_mom_signal_line", 0.0)), 6),
+        "histogram": round(_safe_float(last.get("sc_mom_hist_line", 0.0)), 6),
+        "distance_base_pct": round(_safe_float(last.get("sc_mom_dist_base_pct", 0.0)), 4),
+
+        "ai_age": _safe_int(last.get("sc_mom_ai_age", 0)),
+        "flip": _safe_int(last.get("sc_mom_flip", 0)),
+
+        "bull_weak": _safe_int(last.get("sc_mom_bull_weak", 0)),
+        "bull": _safe_int(last.get("sc_mom_bull", 0)),
+        "bull_strong": _safe_int(last.get("sc_mom_bull_strong", 0)),
+        "bull_ob": _safe_int(last.get("sc_mom_bull_ob", 0)),
+        "bull_ext_ob": _safe_int(last.get("sc_mom_bull_ext_ob", 0)),
+
+        "bear_weak": _safe_int(last.get("sc_mom_bear_weak", 0)),
+        "bear": _safe_int(last.get("sc_mom_bear", 0)),
+        "bear_strong": _safe_int(last.get("sc_mom_bear_strong", 0)),
+        "bear_os": _safe_int(last.get("sc_mom_bear_os", 0)),
+        "bear_ext_os": _safe_int(last.get("sc_mom_bear_ext_os", 0)),
+
+        # Kept available for parity / debug / table alignment
+        "raw_bias_state": _safe_int(last.get("sc_mom_raw_bias_state", 0)),
+        "raw_bias_dir": _safe_int(last.get("sc_mom_raw_bias_dir", 0)),
+        "raw_ai_state": _safe_int(last.get("sc_mom_raw_ai_state", 0)),
+        "raw_ai_dir": _safe_int(last.get("sc_mom_raw_ai_dir", 0)),
+        "state_ready": _safe_int(last.get("sc_mom_state_ready", 0)),
+        "bias_ready": _safe_int(last.get("sc_mom_bias_ready", 0)),
+        "raw_stable_bars": round(_safe_float(last.get("sc_mom_raw_stable_bars", 0.0)), 2),
+        "bias_stable_bars": round(_safe_float(last.get("sc_mom_bias_stable_bars", 0.0)), 2),
+    }
+
+    return payload

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -51,11 +51,56 @@ def _validate_ohlc(df: pd.DataFrame) -> None:
         raise ValueError(f"Missing required OHLC columns: {sorted(missing)}")
 
 
-def _to_float_series(series: pd.Series, index: pd.Index, fill_value: float = 0.0) -> pd.Series:
+def _to_float_series(
+    series: pd.Series,
+    index: pd.Index,
+    fill_value: float = 0.0,
+) -> pd.Series:
     out = pd.to_numeric(series, errors="coerce")
     if not isinstance(out, pd.Series):
         out = pd.Series(out, index=index)
     return out.astype(float).replace([np.inf, -np.inf], np.nan).fillna(fill_value)
+
+
+def _safe_timestamp(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        ts = pd.Timestamp(value)
+        if pd.isna(ts):
+            return None
+        return ts.isoformat()
+    except Exception:
+        return str(value)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        v = float(value)
+        if np.isnan(v) or np.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if pd.isna(value):
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    try:
+        s = str(value)
+        return s if s else default
+    except Exception:
+        return default
 
 
 def _ema(series: pd.Series, length: int) -> pd.Series:
@@ -71,13 +116,23 @@ def _ema(series: pd.Series, length: int) -> pd.Series:
 
 def _sma(series: pd.Series, length: int) -> pd.Series:
     length = max(1, int(length))
-    return pd.to_numeric(series, errors="coerce").fillna(0.0).rolling(length, min_periods=1).mean()
+    return (
+        pd.to_numeric(series, errors="coerce")
+        .fillna(0.0)
+        .rolling(length, min_periods=1)
+        .mean()
+    )
 
 
 def _rma(series: pd.Series, length: int) -> pd.Series:
     length = max(1, int(length))
     alpha = 1.0 / float(length)
-    return pd.to_numeric(series, errors="coerce").fillna(0.0).ewm(alpha=alpha, adjust=False).mean()
+    return (
+        pd.to_numeric(series, errors="coerce")
+        .fillna(0.0)
+        .ewm(alpha=alpha, adjust=False)
+        .mean()
+    )
 
 
 def _bars_since_change(series: pd.Series) -> pd.Series:
@@ -213,20 +268,12 @@ def _compute_raw_regime(df: pd.DataFrame, cfg: RegimeConfig) -> pd.DataFrame:
     expansion = atr_ratio >= cfg.atr_expand_mult
     contraction = atr_ratio <= cfg.atr_contract_mult
 
-    # -------------------------------------------------------------------------
-    # Regime logic
-    # Keep structure simple and stable:
-    # - Trend: structure present + non-compressed + strength confirmation
-    # - Range: compressed/neutral structure + weakness confirmation
-    # - Transition: anything in-between
-    # -------------------------------------------------------------------------
-
     trend_condition = (
-    (trend_dir != 0)
-    & (
-        (adx >= cfg.adx_trend_min)
-        | (er >= cfg.er_trend_min)
-        | (atr_ratio >= cfg.atr_expand_mult)
+        (trend_dir != 0)
+        & (
+            (adx >= cfg.adx_trend_min)
+            | (er >= cfg.er_trend_min)
+            | (atr_ratio >= cfg.atr_expand_mult)
         )
     )
 
@@ -241,14 +288,12 @@ def _compute_raw_regime(df: pd.DataFrame, cfg: RegimeConfig) -> pd.DataFrame:
 
     transition_condition = ~(trend_condition | range_condition)
 
-    # 1 = trend, 2 = range, 3 = transition
     raw_regime_state = pd.Series(
         np.where(trend_condition, 1, np.where(range_condition, 2, 3)),
         index=df.index,
         dtype=int,
     )
 
-    # 1 = expansion, 2 = contraction, 3 = normal
     raw_market_state = pd.Series(
         np.where(expansion, 1, np.where(contraction, 2, 3)),
         index=df.index,
@@ -341,7 +386,11 @@ def _apply_memory(
         candidate_bias = int(raw_regime_bias.iloc[i])
 
         can_flip = prev_age >= cfg.hold_bars
-        allow_state_flip = bool(regime_ready.iloc[i]) and (candidate_state != prev_state) and can_flip
+        allow_state_flip = (
+            bool(regime_ready.iloc[i])
+            and (candidate_state != prev_state)
+            and can_flip
+        )
         allow_bias_refresh = bool(bias_ready.iloc[i]) and (candidate_bias != prev_bias)
 
         if allow_state_flip:
@@ -364,8 +413,12 @@ def _apply_memory(
     out["regime_bias"] = pd.Series(regime_bias, index=raw_regime_bias.index, dtype=int)
     out["regime_age"] = pd.Series(regime_age, index=raw_regime_state.index, dtype=int)
 
-    out["regime_changed"] = out["regime_state"].ne(out["regime_state"].shift(1)).fillna(False).astype(int)
-    out["market_changed"] = out["market_state"].ne(out["market_state"].shift(1)).fillna(False).astype(int)
+    out["regime_changed"] = (
+        out["regime_state"].ne(out["regime_state"].shift(1)).fillna(False).astype(int)
+    )
+    out["market_changed"] = (
+        out["market_state"].ne(out["market_state"].shift(1)).fillna(False).astype(int)
+    )
 
     return out
 
@@ -390,21 +443,22 @@ def _market_text(series: pd.Series) -> pd.Series:
     )
 
 
+def _bias_text(value: int) -> str:
+    if value > 0:
+        return "bullish"
+    if value < 0:
+        return "bearish"
+    return "neutral"
+
+
 # =============================================================================
-# PUBLIC API
+# PUBLIC ENGINE
 # =============================================================================
 
 def calculate_regime(
     df: pd.DataFrame,
     config: Optional[RegimeConfig] = None,
 ) -> pd.DataFrame:
-    """
-    SmartChart Regime Engine
-
-    Expected input:
-        DataFrame indexed by datetime with:
-        open, high, low, close
-    """
     cfg = config or RegimeConfig()
     _validate_ohlc(df)
 
@@ -437,10 +491,6 @@ def calculate_regime(
     out["is_contraction"] = (out["market_state"] == 2).astype(int)
     out["is_normal_market"] = (out["market_state"] == 3).astype(int)
 
-    # =========================================================================
-    # SMARTCHART OUTPUT CONTRACT
-    # =========================================================================
-
     out["regime_state_export"] = out["regime_state"].astype(int)
     out["regime_bias_export"] = out["regime_bias"].astype(int)
     out["regime_change_export"] = out["regime_changed"].astype(int)
@@ -460,10 +510,6 @@ def calculate_regime(
     out["regime_direction"] = out["regime_bias"].astype(int)
     out["regime_signal"] = (out["regime_state"] == 1).astype(int)
     out["regime_strength"] = out["raw_regime_strength"].astype(float)
-
-    # =========================================================================
-    # TRUTH ENGINE CONTRACT
-    # =========================================================================
 
     out["regime"] = out["regime_state"].fillna(0).astype(int)
     out["regime_label"] = out["regime_text"].fillna("unknown")
@@ -489,60 +535,65 @@ def run_regime(
 
 
 # =============================================================================
-# DIRECT TEST BLOCK
+# WEBSITE PAYLOAD BUILDER
 # =============================================================================
 
-if __name__ == "__main__":
-    rng = pd.date_range("2026-01-01", periods=1500, freq="5min")
-    np.random.seed(42)
+def build_regime_latest_payload(
+    df: pd.DataFrame,
+    config: Optional[RegimeConfig] = None,
+) -> Dict[str, Any]:
+    result = calculate_regime(df, config=config)
 
-    trend_part = np.linspace(0, 40, 500) + np.random.normal(0, 0.6, 500).cumsum()
-    range_part = 20 + np.random.normal(0, 0.8, 500).cumsum() * 0.2
-    exp_part = np.linspace(-10, 25, 500) + np.random.normal(0, 1.5, 500).cumsum()
+    if result.empty:
+        raise ValueError("Regime payload build failed: empty dataframe result")
 
-    price = np.concatenate([3300 + trend_part, 3340 + range_part, 3320 + exp_part])
-    close = pd.Series(price, index=rng)
-    open_ = close.shift(1).fillna(close.iloc[0])
+    last = result.iloc[-1]
+    ts_value = result.index[-1] if len(result.index) else None
 
-    high = pd.concat([open_, close], axis=1).max(axis=1) + np.random.uniform(0.2, 1.8, len(rng))
-    low = pd.concat([open_, close], axis=1).min(axis=1) - np.random.uniform(0.2, 1.8, len(rng))
+    regime_state = _safe_int(last.get("regime_state_export", 0))
+    market_state = _safe_int(last.get("market_state_export", 0))
+    regime_bias = _safe_int(last.get("regime_bias_export", 0))
 
-    test_df = pd.DataFrame(
-        {
-            "open": open_,
-            "high": high,
-            "low": low,
-            "close": close,
+    payload: Dict[str, Any] = {
+        "indicator": "regime",
+        "debug_version": "regime_payload_v1",
+        "timestamp": _safe_timestamp(ts_value),
+
+        "regime_state": regime_state,
+        "regime_label": _safe_str(last.get("regime_label", "unknown")),
+        "regime_bias": regime_bias,
+        "regime_bias_label": _bias_text(regime_bias),
+        "regime_strength": round(_safe_float(last.get("regime_strength_export", 0.0)), 6),
+        "regime_change": _safe_int(last.get("regime_change_export", 0)),
+
+        "market_state": market_state,
+        "market_label": _safe_str(last.get("market_condition_label", "unknown")),
+        "market_change": _safe_int(last.get("market_change_export", 0)),
+
+        "trend_condition": _safe_int(last.get("trend_condition_export", 0)),
+        "range_condition": _safe_int(last.get("range_condition_export", 0)),
+        "transition_condition": _safe_int(last.get("transition_condition_export", 0)),
+
+        "expansion": _safe_int(last.get("expansion_export", 0)),
+        "contraction": _safe_int(last.get("contraction_export", 0)),
+
+        "trend_dir": _safe_int(last.get("trend_dir", 0)),
+        "adx": round(_safe_float(last.get("adx", 0.0)), 6),
+        "plus_di": round(_safe_float(last.get("plus_di", 0.0)), 6),
+        "minus_di": round(_safe_float(last.get("minus_di", 0.0)), 6),
+        "atr_ratio": round(_safe_float(last.get("atr_ratio", 0.0)), 6),
+        "efficiency_ratio": round(_safe_float(last.get("efficiency_ratio", 0.0)), 6),
+        "ema_spread_pct": round(_safe_float(last.get("ema_spread_pct", 0.0)), 6),
+        "ema_fast_slope": round(_safe_float(last.get("ema_fast_slope", 0.0)), 6),
+        "ema_slow_slope": round(_safe_float(last.get("ema_slow_slope", 0.0)), 6),
+        "compression": _safe_int(last.get("compression", 0)),
+        "regime_age": _safe_int(last.get("regime_age", 0)),
+
+        "price": {
+            "close": round(_safe_float(df["close"].iloc[-1]), 6),
         },
-        index=rng,
-    )
 
-    result = calculate_regime(test_df)
+        "config": asdict(config or RegimeConfig()),
+    }
 
-    cols = [
-        "adx",
-        "atr_ratio",
-        "efficiency_ratio",
-        "trend_dir",
-        "regime_state_export",
-        "regime_bias_export",
-        "market_state_export",
-        "trend_condition_export",
-        "range_condition_export",
-        "transition_condition_export",
-        "expansion_export",
-        "contraction_export",
-        "regime_strength_export",
-        "regime_text",
-        "market_text",
-        "regime_direction",
-        "regime_signal",
-        "regime_strength",
-        "regime",
-        "regime_label",
-        "market_condition",
-        "market_condition_label",
-    ]
-
-    print("SmartChart Regime Engine — direct test")
-    print(result[cols].tail(30))
+    return payload

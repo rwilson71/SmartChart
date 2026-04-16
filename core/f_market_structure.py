@@ -65,9 +65,35 @@ DEFAULT_MARKET_STRUCTURE_CONFIG: Dict[str, Any] = asdict(MarketStructureConfig()
 # HELPERS
 # =============================================================================
 
-
 def _series_float(x: pd.Series) -> pd.Series:
     return pd.to_numeric(x, errors="coerce").astype(float)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(value):
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if pd.isna(value):
+            return int(default)
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def _safe_bool(value: Any) -> bool:
+    try:
+        if pd.isna(value):
+            return False
+        return bool(value)
+    except Exception:
+        return False
 
 
 def clamp(series_or_value: Any, lo: float, hi: float):
@@ -81,7 +107,7 @@ def bool_score(cond: pd.Series) -> pd.Series:
 
 
 def sign(series: pd.Series) -> pd.Series:
-    out = pd.Series(0.0, index=series.index)
+    out = pd.Series(0.0, index=series.index, dtype=float)
     out = out.mask(series > 0, 1.0)
     out = out.mask(series < 0, -1.0)
     return out
@@ -124,6 +150,13 @@ def lowest(series: pd.Series, length: int) -> pd.Series:
 
 
 def state_text(ms_state: pd.Series, contraction: pd.Series, expansion: pd.Series) -> pd.Series:
+    # Pine parity order:
+    # msState == 2 ? "BULL DISPLACEMENT" :
+    # msState == 1 ? "ACCUMULATION" :
+    # msState == -2 ? "BEAR DISPLACEMENT" :
+    # msState == -1 ? "DISTRIBUTION" :
+    # contraction ? "CONTRACTION" :
+    # expansion ? "EXPANSION" : "TRANSITION"
     out = pd.Series("TRANSITION", index=ms_state.index, dtype=object)
     out = out.mask(expansion.fillna(False), "EXPANSION")
     out = out.mask(contraction.fillna(False), "CONTRACTION")
@@ -139,6 +172,24 @@ def dir_text(ms_dir: pd.Series) -> pd.Series:
     out = out.mask(ms_dir > 0, "BULL")
     out = out.mask(ms_dir < 0, "BEAR")
     return out
+
+
+def impulse_text(impulse_dir: pd.Series) -> pd.Series:
+    out = pd.Series("FLAT", index=impulse_dir.index, dtype=object)
+    out = out.mask(impulse_dir > 0, "UP")
+    out = out.mask(impulse_dir < 0, "DOWN")
+    return out
+
+
+def mtf_state_text(mtf_support_bull: pd.Series, mtf_support_bear: pd.Series) -> pd.Series:
+    out = pd.Series("NEUTRAL", index=mtf_support_bull.index, dtype=object)
+    out = out.mask(mtf_support_bull.fillna(False), "BULL")
+    out = out.mask(mtf_support_bear.fillna(False), "BEAR")
+    return out
+
+
+def _rolling_sum_bool(cond: pd.Series, length: int) -> pd.Series:
+    return cond.fillna(False).astype(int).rolling(max(1, int(length)), min_periods=1).sum()
 
 
 def _resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
@@ -161,7 +212,6 @@ def _resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("MTF mode requires a DatetimeIndex on the input DataFrame.")
 
-    ohlcv = pd.DataFrame(index=df.index)
     src = df[["open", "high", "low", "close"]].copy()
     if "volume" in df.columns:
         src["volume"] = _series_float(df["volume"]).fillna(0.0)
@@ -188,15 +238,20 @@ def _mtf_state_from_ohlc(
     slope_len: int,
 ) -> pd.Series:
     c = _series_float(ohlc["close"])
+
     ef = ema(c, fast_len)
     es = ema(c, slow_len)
-    ef_slope = ef - ef.shift(max(1, int(slope_len))).fillna(ef)
-    es_slope = es - es.shift(max(1, int(slope_len))).fillna(es)
+
+    ef_prev = ef.shift(max(1, int(slope_len))).fillna(ef)
+    es_prev = es.shift(max(1, int(slope_len))).fillna(es)
+
+    ef_slope = ef - ef_prev
+    es_slope = es - es_prev
 
     bull = (ef > es) & (ef_slope > 0) & (es_slope >= 0)
     bear = (ef < es) & (ef_slope < 0) & (es_slope <= 0)
 
-    out = pd.Series(0.0, index=ohlc.index)
+    out = pd.Series(0.0, index=ohlc.index, dtype=float)
     out = out.mask(bull, 1.0)
     out = out.mask(bear, -1.0)
     return out
@@ -211,30 +266,19 @@ def _align_htf_state_to_ltf(htf_state: pd.Series, ltf_index: pd.Index) -> pd.Ser
 # ENGINE
 # =============================================================================
 
-
 def run_market_structure_engine(
     df: pd.DataFrame,
     config: Optional[Dict[str, Any]] = None,
     mtf_frames: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     """
-    SmartChart Backend — f_market_structure.py
+    SmartChart Market Structure Engine
+    Pine parity authority preserved.
 
-    Clean rebuild from Pine authority.
     Build order:
-    inputs → helpers → core structure logic → displacement → compression/expansion
-    → regime classification → state engine → MTF layer → export fields → test block.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must include columns: open, high, low, close.
-        Volume is optional; if missing, it is replaced with 1.0 for Pine-style fallback.
-    config : Optional[Dict[str, Any]]
-        Partial config override.
-    mtf_frames : Optional[Dict[str, str]]
-        Real MTF timeframes. Expected keys: tf1, tf2, tf3, tf4, tf5.
-        Example for 1m base chart: {"tf1": "5", "tf2": "15", "tf3": "60", "tf4": "240", "tf5": "D"}
+    helpers -> core calculations -> trend support -> displacement ->
+    contraction/expansion -> accumulation/distribution -> transition ->
+    MTF -> scoring -> final state -> exports
     """
     if df is None or df.empty:
         raise ValueError("Input DataFrame is empty.")
@@ -254,7 +298,7 @@ def run_market_structure_engine(
     h = _series_float(out["high"])
     l = _series_float(out["low"])
     c = _series_float(out["close"])
-    v = _series_float(out["volume"]) if "volume" in out.columns else pd.Series(1.0, index=out.index)
+    v = _series_float(out["volume"]) if "volume" in out.columns else pd.Series(1.0, index=out.index, dtype=float)
     v = v.fillna(1.0)
 
     mintick = 1e-9
@@ -275,13 +319,9 @@ def run_market_structure_engine(
     vol_src = v.copy()
     vol_ma = sma(vol_src, cfg.vol_len)
 
-    rel_atr = np.where(atr_ma > 0, atr_val / atr_ma, 1.0)
-    rel_range = np.where(range_ma > 0, bar_range / range_ma, 1.0)
-    rel_vol = np.where(vol_ma > 0, vol_src / vol_ma, 1.0)
-
-    rel_atr = pd.Series(rel_atr, index=out.index, dtype=float)
-    rel_range = pd.Series(rel_range, index=out.index, dtype=float)
-    rel_vol = pd.Series(rel_vol, index=out.index, dtype=float)
+    rel_atr = pd.Series(np.where(atr_ma > 0, atr_val / atr_ma, 1.0), index=out.index, dtype=float)
+    rel_range = pd.Series(np.where(range_ma > 0, bar_range / range_ma, 1.0), index=out.index, dtype=float)
+    rel_vol = pd.Series(np.where(vol_ma > 0, vol_src / vol_ma, 1.0), index=out.index, dtype=float)
 
     rng_safe = (h - l).clip(lower=mintick)
     delta_raw = vol_src * (c - o) / rng_safe
@@ -290,7 +330,11 @@ def run_market_structure_engine(
     delta_norm = clamp(delta_raw / delta_base, -1.0, 1.0)
 
     price_change = c - c.shift(cfg.impulse_len).fillna(c)
-    impulse_atr = pd.Series(np.where(atr_val > 0, price_change / atr_val.clip(lower=mintick), 0.0), index=out.index)
+    impulse_atr = pd.Series(
+        np.where(atr_val > 0, price_change / atr_val.clip(lower=mintick), 0.0),
+        index=out.index,
+        dtype=float,
+    )
     impulse_dir = sign(impulse_atr)
 
     # -------------------------------------------------------------------------
@@ -299,11 +343,24 @@ def run_market_structure_engine(
     ema_fast = ema(c, cfg.ema_fast_len)
     ema_slow = ema(c, cfg.ema_slow_len)
 
-    ema_fast_slope = ema_fast - ema_fast.shift(cfg.ema_slope_len).fillna(ema_fast)
-    ema_slow_slope = ema_slow - ema_slow.shift(cfg.ema_slope_len).fillna(ema_slow)
+    ema_fast_prev = ema_fast.shift(cfg.ema_slope_len).fillna(ema_fast)
+    ema_slow_prev = ema_slow.shift(cfg.ema_slope_len).fillna(ema_slow)
 
-    trend_bull = (ema_fast > ema_slow) & (ema_fast_slope > 0) & (ema_slow_slope >= 0) if cfg.trend_on else pd.Series(False, index=out.index)
-    trend_bear = (ema_fast < ema_slow) & (ema_fast_slope < 0) & (ema_slow_slope <= 0) if cfg.trend_on else pd.Series(False, index=out.index)
+    ema_fast_slope = ema_fast - ema_fast_prev
+    ema_slow_slope = ema_slow - ema_slow_prev
+
+    trend_bull = (
+        (ema_fast > ema_slow)
+        & (ema_fast_slope > 0)
+        & (ema_slow_slope >= 0)
+    ) if cfg.trend_on else pd.Series(False, index=out.index)
+
+    trend_bear = (
+        (ema_fast < ema_slow)
+        & (ema_fast_slope < 0)
+        & (ema_slow_slope <= 0)
+    ) if cfg.trend_on else pd.Series(False, index=out.index)
+
     trend_neutral = ~trend_bull & ~trend_bear
 
     trend_support_bull = trend_bull if cfg.trend_on else pd.Series(True, index=out.index)
@@ -327,15 +384,22 @@ def run_market_structure_engine(
         & (rel_vol >= cfg.disp_vol_mult)
     )
 
+    # Pine parity:
+    # bullFollow = ta.highest(high, dispFollowBars) > nz(high[1], high)
+    # bearFollow = ta.lowest(low, dispFollowBars) < nz(low[1], low)
     bull_follow = highest(h, cfg.disp_follow_bars) > h.shift(1).fillna(h)
     bear_follow = lowest(l, cfg.disp_follow_bars) < l.shift(1).fillna(l)
 
     bull_displacement = bull_disp_raw & bull_follow
     bear_displacement = bear_disp_raw & bear_follow
 
-    disp_strength_raw = pd.Series(np.where(atr_val > 0, body_size / atr_val.clip(lower=mintick), 0.0), index=out.index)
+    disp_strength_raw = pd.Series(
+        np.where(atr_val > 0, body_size / atr_val.clip(lower=mintick), 0.0),
+        index=out.index,
+        dtype=float,
+    )
 
-    bull_disp_strength = pd.Series(0.0, index=out.index)
+    bull_disp_strength = pd.Series(0.0, index=out.index, dtype=float)
     bull_disp_strength = bull_disp_strength.mask(
         bull_displacement,
         clamp(
@@ -346,7 +410,7 @@ def run_market_structure_engine(
         ),
     )
 
-    bear_disp_strength = pd.Series(0.0, index=out.index)
+    bear_disp_strength = pd.Series(0.0, index=out.index, dtype=float)
     bear_disp_strength = bear_disp_strength.mask(
         bear_displacement,
         clamp(
@@ -358,7 +422,7 @@ def run_market_structure_engine(
     )
 
     # -------------------------------------------------------------------------
-    # COMPRESSION / EXPANSION
+    # CONTRACTION / EXPANSION
     # -------------------------------------------------------------------------
     range_compression = highest(h, cfg.compress_len) - lowest(l, cfg.compress_len)
 
@@ -415,41 +479,70 @@ def run_market_structure_engine(
     )
 
     # -------------------------------------------------------------------------
-    # MTF LAYER
+    # MTF ENGINE
     # -------------------------------------------------------------------------
     default_frames = {"tf1": "5", "tf2": "15", "tf3": "60", "tf4": "240", "tf5": "D"}
     frames = {**default_frames, **(mtf_frames or {})}
 
     if cfg.mtf_on:
         s1 = _align_htf_state_to_ltf(
-            _mtf_state_from_ohlc(_resample_ohlcv(out, frames["tf1"]), cfg.ema_fast_len, cfg.ema_slow_len, cfg.ema_slope_len),
+            _mtf_state_from_ohlc(
+                _resample_ohlcv(out, frames["tf1"]),
+                cfg.ema_fast_len,
+                cfg.ema_slow_len,
+                cfg.ema_slope_len,
+            ),
             out.index,
         )
         s2 = _align_htf_state_to_ltf(
-            _mtf_state_from_ohlc(_resample_ohlcv(out, frames["tf2"]), cfg.ema_fast_len, cfg.ema_slow_len, cfg.ema_slope_len),
+            _mtf_state_from_ohlc(
+                _resample_ohlcv(out, frames["tf2"]),
+                cfg.ema_fast_len,
+                cfg.ema_slow_len,
+                cfg.ema_slope_len,
+            ),
             out.index,
         )
         s3 = _align_htf_state_to_ltf(
-            _mtf_state_from_ohlc(_resample_ohlcv(out, frames["tf3"]), cfg.ema_fast_len, cfg.ema_slow_len, cfg.ema_slope_len),
+            _mtf_state_from_ohlc(
+                _resample_ohlcv(out, frames["tf3"]),
+                cfg.ema_fast_len,
+                cfg.ema_slow_len,
+                cfg.ema_slope_len,
+            ),
             out.index,
         )
         s4 = _align_htf_state_to_ltf(
-            _mtf_state_from_ohlc(_resample_ohlcv(out, frames["tf4"]), cfg.ema_fast_len, cfg.ema_slow_len, cfg.ema_slope_len),
+            _mtf_state_from_ohlc(
+                _resample_ohlcv(out, frames["tf4"]),
+                cfg.ema_fast_len,
+                cfg.ema_slow_len,
+                cfg.ema_slope_len,
+            ),
             out.index,
         )
         s5 = _align_htf_state_to_ltf(
-            _mtf_state_from_ohlc(_resample_ohlcv(out, frames["tf5"]), cfg.ema_fast_len, cfg.ema_slow_len, cfg.ema_slope_len),
+            _mtf_state_from_ohlc(
+                _resample_ohlcv(out, frames["tf5"]),
+                cfg.ema_fast_len,
+                cfg.ema_slow_len,
+                cfg.ema_slope_len,
+            ),
             out.index,
         )
     else:
-        s1 = pd.Series(0.0, index=out.index)
-        s2 = pd.Series(0.0, index=out.index)
-        s3 = pd.Series(0.0, index=out.index)
-        s4 = pd.Series(0.0, index=out.index)
-        s5 = pd.Series(0.0, index=out.index)
+        s1 = pd.Series(0.0, index=out.index, dtype=float)
+        s2 = pd.Series(0.0, index=out.index, dtype=float)
+        s3 = pd.Series(0.0, index=out.index, dtype=float)
+        s4 = pd.Series(0.0, index=out.index, dtype=float)
+        s5 = pd.Series(0.0, index=out.index, dtype=float)
 
     mtf_wsum = max(
-        cfg.mtf_weight_1 + cfg.mtf_weight_2 + cfg.mtf_weight_3 + cfg.mtf_weight_4 + cfg.mtf_weight_5,
+        cfg.mtf_weight_1
+        + cfg.mtf_weight_2
+        + cfg.mtf_weight_3
+        + cfg.mtf_weight_4
+        + cfg.mtf_weight_5,
         1e-4,
     )
     mtf_raw = (
@@ -459,14 +552,14 @@ def run_market_structure_engine(
         + s4 * cfg.mtf_weight_4
         + s5 * cfg.mtf_weight_5
     )
-    mtf_avg_dir = (mtf_raw / mtf_wsum) if cfg.mtf_on else pd.Series(0.0, index=out.index)
+    mtf_avg_dir = (mtf_raw / mtf_wsum) if cfg.mtf_on else pd.Series(0.0, index=out.index, dtype=float)
 
     mtf_support_bull = mtf_avg_dir > cfg.mtf_bull_thresh
     mtf_support_bear = mtf_avg_dir < cfg.mtf_bear_thresh
     mtf_agreement_score = mtf_avg_dir.abs()
 
     # -------------------------------------------------------------------------
-    # FINAL STATE LOGIC / REGIME CLASSIFICATION
+    # FINAL STATE LOGIC
     # -------------------------------------------------------------------------
     bull_part_1 = bool_score(accumulation) * 0.18
     bull_part_2 = bool_score(bull_displacement) * 0.24
@@ -484,17 +577,38 @@ def run_market_structure_engine(
     bear_part_6 = bool_score(delta_norm < 0) * 0.10
     bear_part_7 = bool_score(impulse_dir < 0) * 0.12
 
-    bull_context_score = bull_part_1 + bull_part_2 + bull_part_3 + bull_part_4 + bull_part_5 + bull_part_6 + bull_part_7
-    bear_context_score = bear_part_1 + bear_part_2 + bear_part_3 + bear_part_4 + bear_part_5 + bear_part_6 + bear_part_7
+    bull_context_score = (
+        bull_part_1
+        + bull_part_2
+        + bull_part_3
+        + bull_part_4
+        + bull_part_5
+        + bull_part_6
+        + bull_part_7
+    )
+    bear_context_score = (
+        bear_part_1
+        + bear_part_2
+        + bear_part_3
+        + bear_part_4
+        + bear_part_5
+        + bear_part_6
+        + bear_part_7
+    )
 
     bull_score = clamp(bull_context_score, 0.0, 1.0)
     bear_score = clamp(bear_context_score, 0.0, 1.0)
 
-    ms_dir = pd.Series(0.0, index=out.index)
+    ms_dir = pd.Series(0.0, index=out.index, dtype=float)
     ms_dir = ms_dir.mask((bull_score > bear_score) & (bull_score >= 0.35), 1.0)
     ms_dir = ms_dir.mask((bear_score > bull_score) & (bear_score >= 0.35), -1.0)
 
-    ms_state = pd.Series(0.0, index=out.index)
+    # Pine parity order:
+    # bullDisplacement ? 2 :
+    # accumulation ? 1 :
+    # bearDisplacement ? -2 :
+    # distribution ? -1 : 0
+    ms_state = pd.Series(0.0, index=out.index, dtype=float)
     ms_state = ms_state.mask(distribution, -1.0)
     ms_state = ms_state.mask(bear_displacement, -2.0)
     ms_state = ms_state.mask(accumulation, 1.0)
@@ -518,9 +632,22 @@ def run_market_structure_engine(
         1.0,
     )
 
-    quality_trend = ((ms_bull & trend_support_bull) | (ms_bear & trend_support_bear) | (ms_state == 0.0))
-    quality_mtf = ((ms_bull & mtf_support_bull) | (ms_bear & mtf_support_bear) | (ms_state == 0.0))
-    quality_delta = ((ms_bull & (delta_norm > 0)) | (ms_bear & (delta_norm < 0)) | (ms_state == 0.0))
+    quality_trend = (
+        (ms_bull & trend_support_bull)
+        | (ms_bear & trend_support_bear)
+        | (ms_state == 0.0)
+    )
+    quality_mtf = (
+        (ms_bull & mtf_support_bull)
+        | (ms_bear & mtf_support_bear)
+        | (ms_state == 0.0)
+    )
+    quality_delta = (
+        (ms_bull & (delta_norm > 0))
+        | (ms_bear & (delta_norm < 0))
+        | (ms_state == 0.0)
+    )
+
     quality_expansion = pd.Series(True, index=out.index)
     quality_expansion = quality_expansion.mask(
         bull_displacement | bear_displacement,
@@ -539,6 +666,19 @@ def run_market_structure_engine(
 
     sc_state_text = state_text(ms_state, contraction, expansion)
     sc_dir_text = dir_text(ms_dir)
+    sc_impulse_text = impulse_text(impulse_dir)
+    sc_mtf_state_text = mtf_state_text(mtf_support_bull, mtf_support_bear)
+
+    # -------------------------------------------------------------------------
+    # DEBUG ACTIVATION CHECK
+    # -------------------------------------------------------------------------
+    acc_seen = _rolling_sum_bool(accumulation, 300) > 0
+    dist_seen = _rolling_sum_bool(distribution, 300) > 0
+    bull_disp_seen = _rolling_sum_bool(bull_displacement, 300) > 0
+    bear_disp_seen = _rolling_sum_bool(bear_displacement, 300) > 0
+    exp_seen = _rolling_sum_bool(expansion, 300) > 0
+    ctr_seen = _rolling_sum_bool(contraction, 300) > 0
+    trn_seen = _rolling_sum_bool(transition, 300) > 0
 
     # -------------------------------------------------------------------------
     # EXPORT FIELDS
@@ -560,6 +700,7 @@ def run_market_structure_engine(
     out["price_change"] = price_change
     out["impulse_atr"] = impulse_atr
     out["impulse_dir"] = impulse_dir
+    out["impulse_text"] = sc_impulse_text
 
     out["ema_fast"] = ema_fast
     out["ema_slow"] = ema_slow
@@ -607,6 +748,7 @@ def run_market_structure_engine(
     out["mtf_support_bull"] = mtf_support_bull.astype(int)
     out["mtf_support_bear"] = mtf_support_bear.astype(int)
     out["mtf_agreement_score"] = mtf_agreement_score
+    out["mtf_state_text"] = sc_mtf_state_text
 
     out["bull_score"] = bull_score
     out["bear_score"] = bear_score
@@ -618,6 +760,14 @@ def run_market_structure_engine(
     out["ms_quality_score"] = ms_quality_score
     out["state_text"] = sc_state_text
     out["dir_text"] = sc_dir_text
+
+    out["acc_seen"] = acc_seen.astype(int)
+    out["dist_seen"] = dist_seen.astype(int)
+    out["bull_disp_seen"] = bull_disp_seen.astype(int)
+    out["bear_disp_seen"] = bear_disp_seen.astype(int)
+    out["exp_seen"] = exp_seen.astype(int)
+    out["ctr_seen"] = ctr_seen.astype(int)
+    out["trn_seen"] = trn_seen.astype(int)
 
     # SmartChart export contract
     out["sc_ms_state"] = ms_state
@@ -639,66 +789,113 @@ def run_market_structure_engine(
 
     out["sc_ms_delta"] = delta_norm
     out["sc_ms_impulse_dir"] = impulse_dir
+    out["sc_ms_impulse_text"] = sc_impulse_text
 
     out["sc_ms_mtf_avg"] = mtf_avg_dir
     out["sc_ms_mtf_support_bull"] = mtf_support_bull.astype(float)
     out["sc_ms_mtf_support_bear"] = mtf_support_bear.astype(float)
     out["sc_ms_mtf_agreement"] = mtf_agreement_score
+    out["sc_ms_mtf_state_text"] = sc_mtf_state_text
+
+    out["sc_ms_trend_support_bull"] = trend_support_bull.astype(float)
+    out["sc_ms_trend_support_bear"] = trend_support_bear.astype(float)
+
+    out["sc_ms_seen_acc"] = acc_seen.astype(float)
+    out["sc_ms_seen_dist"] = dist_seen.astype(float)
+    out["sc_ms_seen_bull_disp"] = bull_disp_seen.astype(float)
+    out["sc_ms_seen_bear_disp"] = bear_disp_seen.astype(float)
+    out["sc_ms_seen_expand"] = exp_seen.astype(float)
+    out["sc_ms_seen_contract"] = ctr_seen.astype(float)
+    out["sc_ms_seen_transition"] = trn_seen.astype(float)
 
     return out
 
 
 # =============================================================================
-# TEST BLOCK
+# PAYLOAD BUILDER
 # =============================================================================
 
-if __name__ == "__main__":
-    idx = pd.date_range("2026-01-01 08:00:00", periods=600, freq="1min")
-    rng = np.random.default_rng(7)
+def build_market_structure_latest_payload(
+    df: pd.DataFrame,
+    config: Optional[Dict[str, Any]] = None,
+    mtf_frames: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """
+    Build latest Market Structure website payload.
+    Cache-safe and Elementor-ready.
+    """
+    result = run_market_structure_engine(df=df, config=config, mtf_frames=mtf_frames)
+    if result.empty:
+        raise ValueError("Market Structure engine returned empty result.")
 
-    base = 4750 + np.cumsum(rng.normal(0, 0.9, len(idx)))
-    close = pd.Series(base, index=idx)
-    open_ = close.shift(1).fillna(close.iloc[0] - 0.3)
-    spread = np.abs(rng.normal(0.8, 0.3, len(idx))) + 0.05
-    high = pd.concat([open_, close], axis=1).max(axis=1) + spread
-    low = pd.concat([open_, close], axis=1).min(axis=1) - spread
-    volume = pd.Series(rng.integers(100, 1000, len(idx)), index=idx, dtype=float)
+    last = result.iloc[-1]
+    ts = result.index[-1]
 
-    test_df = pd.DataFrame(
-        {
-            "open": open_.values,
-            "high": high.values,
-            "low": low.values,
-            "close": close.values,
-            "volume": volume.values,
+    payload: Dict[str, Any] = {
+        "indicator": "market_structure",
+        "name": "SmartChart Market Structure",
+        "debug_version": "market_structure_payload_v1",
+        "timestamp": str(ts),
+        "state": _safe_int(last.get("sc_ms_state"), 0),
+        "state_text": str(last.get("sc_ms_state_text", "TRANSITION")),
+        "direction": _safe_int(last.get("sc_ms_dir"), 0),
+        "direction_text": str(last.get("sc_ms_dir_text", "NEUTRAL")),
+
+        "scores": {
+            "bull": round(_safe_float(last.get("sc_ms_bull_score")), 4),
+            "bear": round(_safe_float(last.get("sc_ms_bear_score")), 4),
+            "strength": round(_safe_float(last.get("sc_ms_strength")), 4),
+            "quality": round(_safe_float(last.get("sc_ms_quality")), 4),
         },
-        index=idx,
-    )
 
-    result = run_market_structure_engine(
-        test_df,
-        config=None,
-        mtf_frames={"tf1": "5", "tf2": "15", "tf3": "60", "tf4": "240", "tf5": "D"},
-    )
+        "structure": {
+            "accumulation": _safe_bool(last.get("sc_ms_accumulation")),
+            "distribution": _safe_bool(last.get("sc_ms_distribution")),
+            "bull_displacement": _safe_bool(last.get("sc_ms_bull_displacement")),
+            "bear_displacement": _safe_bool(last.get("sc_ms_bear_displacement")),
+            "expansion": _safe_bool(last.get("sc_ms_expansion")),
+            "contraction": _safe_bool(last.get("sc_ms_contraction")),
+            "transition": _safe_bool(last.get("sc_ms_transition")),
+        },
 
-    cols = [
-        "sc_ms_state",
-        "sc_ms_state_text",
-        "sc_ms_dir",
-        "sc_ms_dir_text",
-        "sc_ms_bull_score",
-        "sc_ms_bear_score",
-        "sc_ms_strength",
-        "sc_ms_quality",
-        "sc_ms_accumulation",
-        "sc_ms_distribution",
-        "sc_ms_bull_displacement",
-        "sc_ms_bear_displacement",
-        "sc_ms_expansion",
-        "sc_ms_contraction",
-        "sc_ms_transition",
-        "sc_ms_delta",
-        "sc_ms_impulse_dir",
-        "sc_ms_mtf_avg",
-    ]
-    print(result[cols].tail(10).to_string())
+        "momentum": {
+            "delta": round(_safe_float(last.get("sc_ms_delta")), 4),
+            "impulse_dir": _safe_int(last.get("sc_ms_impulse_dir"), 0),
+            "impulse_text": str(last.get("sc_ms_impulse_text", "FLAT")),
+        },
+
+        "mtf": {
+            "avg": round(_safe_float(last.get("sc_ms_mtf_avg")), 4),
+            "agreement": round(_safe_float(last.get("sc_ms_mtf_agreement")), 4),
+            "support_bull": _safe_bool(last.get("sc_ms_mtf_support_bull")),
+            "support_bear": _safe_bool(last.get("sc_ms_mtf_support_bear")),
+            "state_text": str(last.get("sc_ms_mtf_state_text", "NEUTRAL")),
+        },
+
+        "trend_support": {
+            "bull": _safe_bool(last.get("sc_ms_trend_support_bull")),
+            "bear": _safe_bool(last.get("sc_ms_trend_support_bear")),
+        },
+
+        "seen": {
+            "accumulation": _safe_bool(last.get("sc_ms_seen_acc")),
+            "distribution": _safe_bool(last.get("sc_ms_seen_dist")),
+            "bull_displacement": _safe_bool(last.get("sc_ms_seen_bull_disp")),
+            "bear_displacement": _safe_bool(last.get("sc_ms_seen_bear_disp")),
+            "expansion": _safe_bool(last.get("sc_ms_seen_expand")),
+            "contraction": _safe_bool(last.get("sc_ms_seen_contract")),
+            "transition": _safe_bool(last.get("sc_ms_seen_transition")),
+        },
+
+        "raw": {
+            "atr": round(_safe_float(last.get("atr_val")), 4),
+            "rel_atr": round(_safe_float(last.get("rel_atr")), 4),
+            "rel_range": round(_safe_float(last.get("rel_range")), 4),
+            "rel_vol": round(_safe_float(last.get("rel_vol")), 4),
+            "ema_fast": round(_safe_float(last.get("ema_fast")), 4),
+            "ema_slow": round(_safe_float(last.get("ema_slow")), 4),
+            "ad_mid": round(_safe_float(last.get("ad_mid")), 4),
+        },
+    }
+
+    return payload

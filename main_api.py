@@ -17,7 +17,24 @@ from core.playbook.w_strategy_s1_5 import build_strategy_s1_5
 from routers.trend_api import router as trend_router
 from routers.ema_api import router as ema_router
 from routers.cc_ema_distance_router import router as ema_distance_router
-
+from routers.momentum_api import router as momentum_router
+from routers.ai_rsi_router import router as ai_rsi_router
+from routers.market_structure_api import router as market_structure_router
+from routers.session_daily_api import router as session_daily_router
+from routers.fib_api import router as fib_router
+from routers.liquidity_api import router as liquidity_router
+from routers.orderflow_api import router as orderflow_router
+from routers.confluence_cloud_api import router as confluence_cloud_router
+from routers.volatility_api import router as volatility_router
+from routers.ob_os_api import router as ob_os_router
+from routers.exhaustion_api import router as exhaustion_router
+from routers.mfi_api import router as mfi_router
+from routers.confluence_api import router as confluence_router
+from routers.macd_reversal_api import router as macd_reversal_router
+from routers.pullback_retest_api import router as pullback_retest_router
+from routers.regime_api import router as regime_router
+from routers.fvg_api import router as fvg_router
+from routers.volume_api import router as volume_router
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -64,6 +81,24 @@ app.add_middleware(
 app.include_router(ema_distance_router)
 app.include_router(trend_router)
 app.include_router(ema_router)
+app.include_router(momentum_router)
+app.include_router(ai_rsi_router)
+app.include_router(market_structure_router)
+app.include_router(session_daily_router)
+app.include_router(fib_router)
+app.include_router(liquidity_router)
+app.include_router(orderflow_router)
+app.include_router(confluence_cloud_router)
+app.include_router(volatility_router)
+app.include_router(ob_os_router)
+app.include_router(exhaustion_router)
+app.include_router(mfi_router)
+app.include_router(confluence_router)
+app.include_router(macd_reversal_router)
+app.include_router(pullback_retest_router)
+app.include_router(regime_router)
+app.include_router(fvg_router)
+app.include_router(volume_router)
 # =============================================================================
 # HELPERS
 # =============================================================================

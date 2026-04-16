@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from math import erf, sqrt
-from typing import Dict, Optional
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, Optional
 
+import math
 import numpy as np
 import pandas as pd
 
@@ -14,24 +14,33 @@ import pandas as pd
 
 @dataclass
 class MacdReversalConfig:
-    # MACD trend block
+    # -------------------------------------------------------------------------
+    # MACD Trend block (Pine authority)
+    # -------------------------------------------------------------------------
     fast_length: int = 12
     slow_length: int = 26
     smooth_length: int = 9
     ma_length: int = 50
 
-    # Reversal probability block
+    # -------------------------------------------------------------------------
+    # Reversal Probability block (Pine authority)
+    # -------------------------------------------------------------------------
     osc_period: int = 20
     short_sma_len: int = 5
     long_sma_len: int = 34
-
     duration_std_window: int = 100
 
-    # MTF
+    # -------------------------------------------------------------------------
+    # Optional SmartChart MTF extension
+    # Not part of the original Pine signal logic; keep separate from parity
+    # -------------------------------------------------------------------------
     mtf_on: bool = True
     mtf_weights: tuple[float, float, float, float, float, float] = (
         1.0, 1.0, 1.0, 1.0, 1.0, 1.0
     )
+
+
+DEFAULT_MACD_REVERSAL_CONFIG = MacdReversalConfig()
 
 
 # =============================================================================
@@ -67,11 +76,8 @@ def _cross_under(a: pd.Series, b: pd.Series) -> pd.Series:
 
 
 def _cross_zero(series: pd.Series) -> pd.Series:
-    return ((series > 0) & (series.shift(1) <= 0)) | ((series < 0) & (series.shift(1) >= 0))
-
-
-def _cdf_scalar(x: float) -> float:
-    return 0.5 * (1.0 + erf(float(x) / sqrt(2.0)))
+    prev = series.shift(1)
+    return ((series > 0) & (prev <= 0)) | ((series < 0) & (prev >= 0))
 
 
 def _bars_since_true(condition: pd.Series) -> pd.Series:
@@ -89,22 +95,90 @@ def _bars_since_true(condition: pd.Series) -> pd.Series:
     return pd.Series(out, index=condition.index)
 
 
+def _pine_cdf(z: float) -> float:
+    """
+    Pine-authority approximation from the TradingView script.
+    """
+    if pd.isna(z):
+        return np.nan
+
+    a1 = 0.254829592
+    a2 = -0.284496736
+    a3 = 1.421413741
+    a4 = -1.453152027
+    a5 = 1.061405429
+    p = 0.3275911
+
+    sign = -1.0 if z < 0 else 1.0
+    x = abs(float(z)) / math.sqrt(2.0)
+    t = 1.0 / (1.0 + p * x)
+    erf_approx = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * math.exp(-x * x)
+
+    return 0.5 * (1.0 + sign * erf_approx)
+
+
+def _safe_mean(values: list[float]) -> float:
+    if not values:
+        return np.nan
+    return float(np.mean(values))
+
+
+def _safe_std(values: list[float]) -> float:
+    if len(values) < 2:
+        return np.nan
+    return float(np.std(values, ddof=1))
+
+
 def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    agg = {
-        "open": "first" if "open" in df.columns else "last",
+    agg: Dict[str, str] = {
         "high": "max",
         "low": "min",
         "close": "last",
     }
-    return df.resample(rule).agg(agg).dropna()
+    if "open" in df.columns:
+        agg["open"] = "first"
+
+    out = df.resample(rule).agg(agg).dropna()
+    return out.sort_index()
 
 
 def _align_to_base(series: pd.Series, base_index: pd.Index) -> pd.Series:
     return series.reindex(base_index, method="ffill")
 
 
+def _state_to_text(x: int) -> str:
+    if x > 0:
+        return "bullish"
+    if x < 0:
+        return "bearish"
+    return "sideways"
+
+
+def _clean_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        val = float(x)
+    except Exception:
+        return None
+    if np.isnan(val) or np.isinf(val):
+        return None
+    return val
+
+
+def _clean_int(x: Any) -> Optional[int]:
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+        return int(x)
+    except Exception:
+        return None
+
+
 # =============================================================================
-# CORE INTERNAL CALCS
+# CORE INTERNAL CALCULATIONS
 # =============================================================================
 
 def _compute_macd_block(df: pd.DataFrame, cfg: MacdReversalConfig) -> pd.DataFrame:
@@ -163,9 +237,13 @@ def _compute_reversal_block(df: pd.DataFrame, cfg: MacdReversalConfig) -> pd.Dat
 
     custom_rsi = pd.Series(
         np.where(
-            fall == 0,
+            fall == 0.0,
             100.0,
-            np.where(rise == 0, 0.0, 100.0 - (100.0 / (1.0 + rise / fall))),
+            np.where(
+                rise == 0.0,
+                0.0,
+                100.0 - (100.0 / (1.0 + rise / fall)),
+            ),
         ),
         index=df.index,
         dtype=float,
@@ -174,20 +252,61 @@ def _compute_reversal_block(df: pd.DataFrame, cfg: MacdReversalConfig) -> pd.Dat
     cross_zero = _cross_zero(custom_rsi)
     cut = _bars_since_true(cross_zero)
 
-    segment_duration = cut.shift(1).where(cross_zero)
-    durations_avg = segment_duration.expanding(min_periods=1).mean().reindex(df.index).ffill()
-    durations_std = segment_duration.expanding(min_periods=2).std().reindex(df.index).ffill()
+    # -------------------------------------------------------------------------
+    # Pine parity for duration memory:
+    # var durations = array.new_int()
+    # cut = ta.barssince(ta.cross(customRSI, 0))
+    # if cut == 0 and cut != cut[1]
+    #     durations.unshift(cut[1])
+    # basis = durations.avg()
+    # z = (cut - durations.avg()) / durations.stdev()
+    # -------------------------------------------------------------------------
+    durations_store: list[float] = []
+    durations_avg_vals: list[float] = []
+    durations_std_vals: list[float] = []
+    z_vals: list[float] = []
+    probability_vals: list[float] = []
+
+    cut_vals = cut.to_numpy(dtype=float)
+    cross_vals = cross_zero.fillna(False).to_numpy(dtype=bool)
+
+    for i in range(len(df)):
+        if cross_vals[i]:
+            prev_cut = cut_vals[i - 1] if i > 0 else np.nan
+            if not np.isnan(prev_cut):
+                durations_store.insert(0, float(prev_cut))
+
+        dur_avg = _safe_mean(durations_store)
+        dur_std = _safe_std(durations_store)
+
+        durations_avg_vals.append(dur_avg)
+        durations_std_vals.append(dur_std)
+
+        current_cut = cut_vals[i]
+        if np.isnan(current_cut) or np.isnan(dur_avg) or np.isnan(dur_std) or dur_std == 0.0:
+            z = np.nan
+            prob = np.nan
+        else:
+            z = (current_cut - dur_avg) / dur_std
+            prob = _pine_cdf(z)
+
+        z_vals.append(z)
+        probability_vals.append(prob)
+
+    durations_avg = pd.Series(durations_avg_vals, index=df.index, dtype=float)
+    durations_std = pd.Series(durations_std_vals, index=df.index, dtype=float)
+    z = pd.Series(z_vals, index=df.index, dtype=float)
+    probability = pd.Series(probability_vals, index=df.index, dtype=float)
 
     cut_volatility = cut.rolling(cfg.duration_std_window, min_periods=2).std() / 2.0
 
-    z = (cut - durations_avg) / durations_std.replace(0.0, np.nan)
-    probability = z.fillna(0.0).apply(_cdf_scalar).clip(0.0, 1.0)
-
-    extreme_reversal_probability = (cut > (durations_avg + durations_std * 3.0)).astype(int)
-    high_reversal_probability = (probability > 0.84).astype(int)
-    extreme_probability = (probability > 0.98).astype(int)
-    low_reversal_probability = (probability < 0.14).astype(int)
-    probability_reset = cross_zero.astype(int)
+    high_reversal_probability = (probability > 0.84).fillna(False).astype(int)
+    extreme_probability = (probability > 0.98).fillna(False).astype(int)
+    low_reversal_probability = (probability < 0.14).fillna(False).astype(int)
+    extreme_reversal_probability = (
+        cut > (durations_avg + durations_std * 3.0)
+    ).fillna(False).astype(int)
+    probability_reset = (cut == 0).fillna(False).astype(int)
 
     reversal_bias = pd.Series(
         np.where(custom_rsi > 0, 1, np.where(custom_rsi < 0, -1, 0)),
@@ -252,8 +371,8 @@ def _compute_mtf_layer(
         "tf6": "1D",
     }
 
-    macd_scores = []
-    reversal_scores = []
+    macd_scores: list[pd.Series] = []
+    reversal_scores: list[pd.Series] = []
 
     for key in ["tf1", "tf2", "tf3", "tf4", "tf5", "tf6"]:
         tf_df = _resample_ohlc(df, tf_map[key])
@@ -261,8 +380,13 @@ def _compute_mtf_layer(
         tf_macd = _compute_macd_block(tf_df, cfg)
         tf_rev = _compute_reversal_block(tf_df, cfg)
 
-        macd_score = _align_to_base(tf_macd["market_trend_state"].astype(float), df.index).fillna(0.0)
-        reversal_score = _align_to_base(tf_rev["reversal_probability"].astype(float), df.index).fillna(0.0)
+        macd_score = _align_to_base(
+            tf_macd["market_trend_state"].astype(float), df.index
+        ).fillna(0.0)
+
+        reversal_score = _align_to_base(
+            tf_rev["reversal_probability"].astype(float), df.index
+        ).fillna(0.0)
 
         macd_scores.append(macd_score)
         reversal_scores.append(reversal_score)
@@ -282,7 +406,7 @@ def _compute_mtf_layer(
 
 
 # =============================================================================
-# PUBLIC API
+# PUBLIC CALCULATION API
 # =============================================================================
 
 def calculate_macd_reversal(
@@ -291,13 +415,13 @@ def calculate_macd_reversal(
     timeframe_map: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     """
-    SmartChart backend conversion of Combined MACD & Trend Reversal,
-    now with multi-timeframe averaging.
+    SmartChart backend parity rebuild of:
+    TradingView Pine "Combined MACD & Trend Reversal"
 
-    Expected input:
-        DataFrame indexed by datetime with:
-        high, low, close
-        open optional for resampling quality
+    Input:
+        DatetimeIndex
+        required columns: high, low, close
+        optional: open (improves MTF resampling quality)
     """
     cfg = config or MacdReversalConfig()
     _validate_ohlc(df)
@@ -310,7 +434,9 @@ def calculate_macd_reversal(
 
     out = pd.concat([macd_block, reversal_block, mtf_block], axis=1)
 
+    # -------------------------------------------------------------------------
     # Export contract
+    # -------------------------------------------------------------------------
     out["macd_trend_export"] = out["market_trend_state"].astype(int)
     out["macd_signal_export"] = out["macd_signal_state"].astype(int)
     out["macd_bullish_dot_export"] = out["bullish_dot"].astype(int)
@@ -328,13 +454,136 @@ def calculate_macd_reversal(
     out["macd_mtf_avg_export"] = out["macd_mtf_avg"].astype(float)
     out["reversal_mtf_avg_export"] = out["reversal_mtf_avg"].astype(float)
 
+    # -------------------------------------------------------------------------
     # SmartChart helpers
+    # -------------------------------------------------------------------------
     out["macd_direction"] = out["market_trend_state"].astype(int)
-    out["macd_signal"] = np.where(out["macd_signal_state"] != 0, 1, 0).astype(int)
-    out["reversal_signal"] = ((out["high_reversal_probability"] == 1) | (out["extreme_probability"] == 1)).astype(int)
+    out["macd_signal"] = (out["macd_signal_state"] != 0).astype(int)
+    out["reversal_signal"] = (
+        (out["high_reversal_probability"] == 1)
+        | (out["extreme_probability"] == 1)
+    ).astype(int)
     out["reversal_strength"] = out["reversal_probability"].astype(float)
 
+    out["trend_state_text"] = out["market_trend_state"].apply(_state_to_text)
+    out["reversal_bias_text"] = out["reversal_bias"].apply(_state_to_text)
+
+    out["combined_state_text"] = np.where(
+        (out["market_trend_state"] > 0) & (out["reversal_bias"] > 0),
+        "bullish_continuation",
+        np.where(
+            (out["market_trend_state"] < 0) & (out["reversal_bias"] < 0),
+            "bearish_continuation",
+            np.where(
+                out["reversal_signal"] == 1,
+                "reversal_risk",
+                "mixed",
+            ),
+        ),
+    )
+
     return out
+
+
+# =============================================================================
+# PAYLOAD BUILDER
+# =============================================================================
+
+def build_macd_reversal_latest_payload(
+    df: pd.DataFrame,
+    config: Optional[MacdReversalConfig] = None,
+    timeframe_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    cfg = config or MacdReversalConfig()
+    calc = calculate_macd_reversal(df, config=cfg, timeframe_map=timeframe_map)
+
+    if calc.empty:
+        return {
+            "ok": False,
+            "indicator": "macd_reversal",
+            "error": "Empty calculation output",
+        }
+
+    last = calc.iloc[-1]
+    last_ts = calc.index[-1]
+
+    probability = _clean_float(last.get("reversal_probability"))
+    probability_pct = None if probability is None else round(probability * 100.0, 2)
+
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "indicator": "macd_reversal",
+        "source_authority": "TradingView Pine",
+        "timestamp": str(last_ts),
+        "config": asdict(cfg),
+
+        "macd_trend": {
+            "macd_line": _clean_float(last.get("macd_line")),
+            "signal_line": _clean_float(last.get("macd_signal_line")),
+            "histogram": _clean_float(last.get("macd_hist")),
+            "moving_average": _clean_float(last.get("trend_ma")),
+            "trend_state": last.get("trend_state_text"),
+            "market_trend_state": _clean_int(last.get("market_trend_state")),
+            "bullish_dot": _clean_int(last.get("bullish_dot")),
+            "bearish_dot": _clean_int(last.get("bearish_dot")),
+            "sideways_dot": _clean_int(last.get("sideways_dot")),
+            "macd_signal_state": _clean_int(last.get("macd_signal_state")),
+        },
+
+        "reversal_probability": {
+            "custom_rsi": _clean_float(last.get("custom_rsi")),
+            "cut": _clean_float(last.get("cut")),
+            "avg_duration": _clean_float(last.get("durations_avg")),
+            "duration_std": _clean_float(last.get("durations_std")),
+            "cut_volatility": _clean_float(last.get("cut_volatility")),
+            "z_score": _clean_float(last.get("reversal_zscore")),
+            "probability": probability,
+            "probability_pct": probability_pct,
+            "bias_state": last.get("reversal_bias_text"),
+            "bias_value": _clean_int(last.get("reversal_bias")),
+            "momentum": _clean_int(last.get("reversal_momentum")),
+            "high_reversal": _clean_int(last.get("high_reversal_probability")),
+            "extreme_reversal_duration": _clean_int(last.get("extreme_reversal_probability")),
+            "extreme_probability": _clean_int(last.get("extreme_probability")),
+            "low_reversal": _clean_int(last.get("low_reversal_probability")),
+            "reset_state": _clean_int(last.get("probability_reset")),
+        },
+
+        "mtf": {
+            "macd_mtf_avg": _clean_float(last.get("macd_mtf_avg")),
+            "reversal_mtf_avg": _clean_float(last.get("reversal_mtf_avg")),
+            "macd_mtf_1": _clean_float(last.get("macd_mtf_1")),
+            "macd_mtf_2": _clean_float(last.get("macd_mtf_2")),
+            "macd_mtf_3": _clean_float(last.get("macd_mtf_3")),
+            "macd_mtf_4": _clean_float(last.get("macd_mtf_4")),
+            "macd_mtf_5": _clean_float(last.get("macd_mtf_5")),
+            "macd_mtf_6": _clean_float(last.get("macd_mtf_6")),
+            "reversal_mtf_1": _clean_float(last.get("reversal_mtf_1")),
+            "reversal_mtf_2": _clean_float(last.get("reversal_mtf_2")),
+            "reversal_mtf_3": _clean_float(last.get("reversal_mtf_3")),
+            "reversal_mtf_4": _clean_float(last.get("reversal_mtf_4")),
+            "reversal_mtf_5": _clean_float(last.get("reversal_mtf_5")),
+            "reversal_mtf_6": _clean_float(last.get("reversal_mtf_6")),
+        },
+
+        "summary": {
+            "direction_bias": last.get("trend_state_text"),
+            "reversal_state": last.get("reversal_bias_text"),
+            "combined_state": last.get("combined_state_text"),
+            "macd_signal": _clean_int(last.get("macd_signal")),
+            "reversal_signal": _clean_int(last.get("reversal_signal")),
+            "reversal_strength": _clean_float(last.get("reversal_strength")),
+            "quality_note": (
+                "Extreme reversal probability"
+                if _clean_int(last.get("extreme_probability")) == 1
+                else "High reversal probability"
+                if _clean_int(last.get("high_reversal_probability")) == 1
+                else "Normal probability state"
+            ),
+        },
+    }
+
+    return payload
 
 
 # =============================================================================
@@ -364,6 +613,7 @@ if __name__ == "__main__":
     )
 
     result = calculate_macd_reversal(test_df)
+    payload = build_macd_reversal_latest_payload(test_df)
 
     cols = [
         "market_trend_state",
@@ -377,7 +627,10 @@ if __name__ == "__main__":
         "reversal_probability_export",
         "reversal_signal",
         "reversal_strength",
+        "combined_state_text",
     ]
 
-    print("SmartChart MACD Reversal Module MTF — direct test")
-    print(result[cols].tail(30))
+    print("SmartChart MACD Reversal Module — direct test")
+    print(result[cols].tail(10))
+    print("\nLatest payload:")
+    print(payload)

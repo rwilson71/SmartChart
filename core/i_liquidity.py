@@ -23,15 +23,15 @@ Core features:
 - Final liquidity state engine
 - SmartChart-ready output contract
 
-Backend only:
-- no TradingView visuals
-- no labels / boxes / tables
-- clean dataframe output
+Production rules:
+- Pine authority first
+- No TradingView visuals
+- No test block inside core
+- Payload builder in this file is the single source of truth
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -130,24 +130,28 @@ def _rsi(series: pd.Series, length: int) -> pd.Series:
 def _pivot_high(series: pd.Series, left: int, right: int) -> pd.Series:
     vals = series.to_numpy(dtype=float)
     out = np.full(len(vals), np.nan, dtype=float)
+
     for i in range(left, len(vals) - right):
         window = vals[i - left:i + right + 1]
         center = vals[i]
         if np.isfinite(center) and center == np.nanmax(window):
             if np.sum(np.isclose(window, center, equal_nan=False)) == 1:
                 out[i + right] = center
+
     return pd.Series(out, index=series.index)
 
 
 def _pivot_low(series: pd.Series, left: int, right: int) -> pd.Series:
     vals = series.to_numpy(dtype=float)
     out = np.full(len(vals), np.nan, dtype=float)
+
     for i in range(left, len(vals) - right):
         window = vals[i - left:i + right + 1]
         center = vals[i]
         if np.isfinite(center) and center == np.nanmin(window):
             if np.sum(np.isclose(window, center, equal_nan=False)) == 1:
                 out[i + right] = center
+
     return pd.Series(out, index=series.index)
 
 
@@ -155,12 +159,14 @@ def _barssince(condition: pd.Series) -> pd.Series:
     out = np.full(len(condition), np.nan, dtype=float)
     last_true = None
     vals = condition.fillna(False).to_numpy(dtype=bool)
+
     for i, v in enumerate(vals):
         if v:
             last_true = i
             out[i] = 0.0
         elif last_true is not None:
             out[i] = float(i - last_true)
+
     return pd.Series(out, index=condition.index)
 
 
@@ -174,6 +180,7 @@ def _safe_div(a: pd.Series | float, b: pd.Series | float, fill: float = 0.0):
         b_s = b if isinstance(b, pd.Series) else pd.Series(b, index=a.index)  # type: ignore[arg-type]
         out = a_s / b_s.replace(0.0, np.nan)
         return out.replace([np.inf, -np.inf], np.nan).fillna(fill)
+
     if b == 0:
         return fill
     return a / b
@@ -200,7 +207,10 @@ def _rolling_prev_day_high_low(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
     prev_high = day_key.map(prev_daily["day_high"])
     prev_low = day_key.map(prev_daily["day_low"])
 
-    return pd.Series(prev_high, index=df.index, dtype=float), pd.Series(prev_low, index=df.index, dtype=float)
+    return (
+        pd.Series(prev_high, index=df.index, dtype=float),
+        pd.Series(prev_low, index=df.index, dtype=float),
+    )
 
 
 def _state_text_from_dir_and_scores(
@@ -220,6 +230,61 @@ def _state_text_from_dir_and_scores(
     state = state.mask(bull_sweep_active, "bull_sweep_active")
     state = state.mask(bear_sweep_active, "bear_sweep_active")
     return state
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return str(value)
+    except Exception:
+        return default
+
+
+def _dir_text(v: int) -> str:
+    return "Bull" if v > 0 else "Bear" if v < 0 else "Neutral"
+
+
+def _pd_text(pd_state: int) -> str:
+    return "Discount" if pd_state > 0 else "Premium" if pd_state < 0 else "Equilibrium"
+
+
+def _obos_div_text(state: int) -> str:
+    if state == 2:
+        return "Bull Peak"
+    if state == -2:
+        return "Bear Peak"
+    if state == 1:
+        return "Bull OBOS"
+    if state == -1:
+        return "Bear OBOS"
+    return "Neutral"
+
+
+def _agreement_text(v: float, bull_thr: float, bear_thr: float) -> str:
+    if v > bull_thr:
+        return "Bull"
+    if v < bear_thr:
+        return "Bear"
+    return "Neutral"
 
 
 # =============================================================================
@@ -258,8 +323,12 @@ def _compute_simple_liq_state(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataF
     bull_lower_wick = np.minimum(df["open"], df["close"]) - df["low"]
     bear_upper_wick = df["high"] - np.maximum(df["open"], df["close"])
 
-    bull_wick_reject = (bull_lower_wick > 0) & (bull_lower_wick >= (df["close"] - df["open"]).abs() * 0.5)
-    bear_wick_reject = (bear_upper_wick > 0) & (bear_upper_wick >= (df["close"] - df["open"]).abs() * 0.5)
+    bull_wick_reject = (bull_lower_wick > 0) & (
+        bull_lower_wick >= (df["close"] - df["open"]).abs() * 0.5
+    )
+    bear_wick_reject = (bear_upper_wick > 0) & (
+        bear_upper_wick >= (df["close"] - df["open"]).abs() * 0.5
+    )
 
     hl2 = (df["high"] + df["low"]) / 2.0
     bull_close_intent = (df["close"] > df["open"]) | (df["close"] > hl2)
@@ -279,11 +348,25 @@ def _compute_simple_liq_state(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataF
     prev_px_hi = px_hi.ffill().shift(1)
     prev_rsi_hi = rsi_hi.ffill().shift(1)
 
-    bull_div = px_lo.notna() & rsi_lo.notna() & prev_px_lo.notna() & prev_rsi_lo.notna() & (px_lo < prev_px_lo) & (rsi_lo > prev_rsi_lo)
-    bear_div = px_hi.notna() & rsi_hi.notna() & prev_px_hi.notna() & prev_rsi_hi.notna() & (px_hi > prev_px_hi) & (rsi_hi < prev_rsi_hi)
+    bull_div = (
+        px_lo.notna()
+        & rsi_lo.notna()
+        & prev_px_lo.notna()
+        & prev_rsi_lo.notna()
+        & (px_lo < prev_px_lo)
+        & (rsi_lo > prev_rsi_lo)
+    )
+    bear_div = (
+        px_hi.notna()
+        & rsi_hi.notna()
+        & prev_px_hi.notna()
+        & prev_rsi_hi.notna()
+        & (px_hi > prev_px_hi)
+        & (rsi_hi < prev_rsi_hi)
+    )
 
-    raw_bull = swept_below & reclaimed_lo & ((~cfg["liq_use_ema_dist"]) | bull_ema_ok)
-    raw_bear = swept_above & reclaimed_hi & ((~cfg["liq_use_ema_dist"]) | bear_ema_ok)
+    raw_bull = swept_below & reclaimed_lo & ((not cfg["liq_use_ema_dist"]) | bull_ema_ok)
+    raw_bear = swept_above & reclaimed_hi & ((not cfg["liq_use_ema_dist"]) | bear_ema_ok)
 
     bull_qual = (
         raw_bull.astype(int)
@@ -330,8 +413,14 @@ def _compute_simple_liq_state(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataF
     qual = pd.Series(0, index=df.index, dtype=int)
     qual = qual.mask(liq_sweep_state == 1, bull_qual)
     qual = qual.mask(liq_sweep_state == -1, bear_qual)
-    qual = qual.mask((liq_sweep_state == 0) & (liq_state == 1), bull_qual.where(bull_sweep).ffill().fillna(0).astype(int))
-    qual = qual.mask((liq_sweep_state == 0) & (liq_state == -1), bear_qual.where(bear_sweep).ffill().fillna(0).astype(int))
+    qual = qual.mask(
+        (liq_sweep_state == 0) & (liq_state == 1),
+        bull_qual.where(bull_sweep).ffill().fillna(0).astype(int),
+    )
+    qual = qual.mask(
+        (liq_sweep_state == 0) & (liq_state == -1),
+        bear_qual.where(bear_sweep).ffill().fillna(0).astype(int),
+    )
 
     out["liq_state"] = liq_state
     out["liq_sweep_state"] = liq_sweep_state
@@ -390,8 +479,16 @@ def compute_liquidity(
     out["body"] = (out["close"] - out["open"]).abs()
     out["body_frac"] = _safe_div(out["body"], out["rng"], fill=0.0)
     out["close_pos"] = _safe_div(out["close"] - out["low"], out["rng"], fill=0.5)
-    out["wick_top_frac"] = _safe_div(out["high"] - np.maximum(out["open"], out["close"]), out["rng"], fill=0.0)
-    out["wick_bot_frac"] = _safe_div(np.minimum(out["open"], out["close"]) - out["low"], out["rng"], fill=0.0)
+    out["wick_top_frac"] = _safe_div(
+        out["high"] - np.maximum(out["open"], out["close"]),
+        out["rng"],
+        fill=0.0,
+    )
+    out["wick_bot_frac"] = _safe_div(
+        np.minimum(out["open"], out["close"]) - out["low"],
+        out["rng"],
+        fill=0.0,
+    )
 
     out["trend_up"] = (out["ema20"] > out["ema50"]) & (out["ema50"] > out["ema200"])
     out["trend_dn"] = (out["ema20"] < out["ema50"]) & (out["ema50"] < out["ema200"])
@@ -420,11 +517,23 @@ def compute_liquidity(
     # -------------------------------------------------------------------------
     # Cluster strength
     # -------------------------------------------------------------------------
-    ph_cluster_hit = (out["ph"].notna()) & (out["last_ph"].notna()) & ((out["ph"] - out["last_ph"]).abs() <= out["zone_tol"])
-    pl_cluster_hit = (out["pl"].notna()) & (out["last_pl"].notna()) & ((out["pl"] - out["last_pl"]).abs() <= out["zone_tol"])
+    ph_cluster_hit = (
+        out["ph"].notna()
+        & out["last_ph"].notna()
+        & ((out["ph"] - out["last_ph"]).abs() <= out["zone_tol"])
+    )
+    pl_cluster_hit = (
+        out["pl"].notna()
+        & out["last_pl"].notna()
+        & ((out["pl"] - out["last_pl"]).abs() <= out["zone_tol"])
+    )
 
-    out["ph_cluster_strength"] = ph_cluster_hit.astype(float).rolling(cfg["cluster_window"], min_periods=1).sum()
-    out["pl_cluster_strength"] = pl_cluster_hit.astype(float).rolling(cfg["cluster_window"], min_periods=1).sum()
+    out["ph_cluster_strength"] = (
+        ph_cluster_hit.astype(float).rolling(cfg["cluster_window"], min_periods=1).sum()
+    )
+    out["pl_cluster_strength"] = (
+        pl_cluster_hit.astype(float).rolling(cfg["cluster_window"], min_periods=1).sum()
+    )
 
     # -------------------------------------------------------------------------
     # Sweep / reclaim structure
@@ -451,8 +560,16 @@ def compute_liquidity(
     out["recent_sweep_high"] = out["bars_since_sweep_high"] <= cfg["reclaim_bars"]
     out["recent_sweep_low"] = out["bars_since_sweep_low"] <= cfg["reclaim_bars"]
 
-    out["reclaim_high_now"] = out["last_ph"].notna() & (out["close"] < out["last_ph"]) & (out["close_pos"] <= 0.40)
-    out["reclaim_low_now"] = out["last_pl"].notna() & (out["close"] > out["last_pl"]) & (out["close_pos"] >= 0.60)
+    out["reclaim_high_now"] = (
+        out["last_ph"].notna()
+        & (out["close"] < out["last_ph"])
+        & (out["close_pos"] <= 0.40)
+    )
+    out["reclaim_low_now"] = (
+        out["last_pl"].notna()
+        & (out["close"] > out["last_pl"])
+        & (out["close_pos"] >= 0.60)
+    )
 
     out["reclaim_high"] = out["recent_sweep_high"] & out["reclaim_high_now"]
     out["reclaim_low"] = out["recent_sweep_low"] & out["reclaim_low_now"]
@@ -469,8 +586,16 @@ def compute_liquidity(
     # -------------------------------------------------------------------------
     # V1-style sweep quality / EMA dist / OBOS / divergence
     # -------------------------------------------------------------------------
-    out["bull_ema_dist_pct"] = _safe_div((out["liq_ema"] - out["low"]) * 100.0, out["liq_ema"], fill=0.0)
-    out["bear_ema_dist_pct"] = _safe_div((out["high"] - out["liq_ema"]) * 100.0, out["liq_ema"], fill=0.0)
+    out["bull_ema_dist_pct"] = _safe_div(
+        (out["liq_ema"] - out["low"]) * 100.0,
+        out["liq_ema"],
+        fill=0.0,
+    )
+    out["bear_ema_dist_pct"] = _safe_div(
+        (out["high"] - out["liq_ema"]) * 100.0,
+        out["liq_ema"],
+        fill=0.0,
+    )
 
     out["bull_ema_dist_ok"] = out["bull_ema_dist_pct"] >= cfg["liq_min_dist_pct"]
     out["bear_ema_dist_ok"] = out["bear_ema_dist_pct"] >= cfg["liq_min_dist_pct"]
@@ -517,8 +642,16 @@ def compute_liquidity(
         & (out["rsi_hi"] < prev_rsi_hi)
     )
 
-    ema_gate_bull = out["bull_ema_dist_ok"] if cfg["liq_use_ema_dist"] else pd.Series(True, index=out.index)
-    ema_gate_bear = out["bear_ema_dist_ok"] if cfg["liq_use_ema_dist"] else pd.Series(True, index=out.index)
+    ema_gate_bull = (
+        out["bull_ema_dist_ok"]
+        if cfg["liq_use_ema_dist"]
+        else pd.Series(True, index=out.index)
+    )
+    ema_gate_bear = (
+        out["bear_ema_dist_ok"]
+        if cfg["liq_use_ema_dist"]
+        else pd.Series(True, index=out.index)
+    )
 
     out["raw_bull_sweep_qual"] = out["sweep_low"] & out["reclaim_low_now"] & ema_gate_bull
     out["raw_bear_sweep_qual"] = out["sweep_high"] & out["reclaim_high_now"] & ema_gate_bear
@@ -526,8 +659,12 @@ def compute_liquidity(
     out["bull_sweep_obos"] = out["raw_bull_sweep_qual"] & out["is_oversold"]
     out["bear_sweep_obos"] = out["raw_bear_sweep_qual"] & out["is_overbought"]
 
-    out["bull_sweep_peak"] = out["raw_bull_sweep_qual"] & out["is_oversold"] & out["bullish_div"]
-    out["bear_sweep_peak"] = out["raw_bear_sweep_qual"] & out["is_overbought"] & out["bearish_div"]
+    out["bull_sweep_peak"] = (
+        out["raw_bull_sweep_qual"] & out["is_oversold"] & out["bullish_div"]
+    )
+    out["bear_sweep_peak"] = (
+        out["raw_bear_sweep_qual"] & out["is_overbought"] & out["bearish_div"]
+    )
 
     out["bull_qual"] = (
         out["raw_bull_sweep_qual"].astype(int)
@@ -627,12 +764,28 @@ def compute_liquidity(
     out["displacement_dn"] = out["disp_dn_raw"] & out["vol_confirm"]
 
     out["disp_strength"] = (
-        50.0 * _clamp(_safe_div(out["rng"], out["atr_disp"] * cfg["disp_range_mult"], fill=0.0), 0.0, 1.0)
-        + 25.0 * _clamp(_safe_div(out["body_frac"], cfg["disp_body_frac_min"], fill=0.0), 0.0, 1.0)
-        + 25.0 * _clamp(_safe_div(out["vol_ratio"], cfg["vol_confirm_mult"], fill=0.0), 0.0, 1.0)
+        50.0 * _clamp(
+            _safe_div(out["rng"], out["atr_disp"] * cfg["disp_range_mult"], fill=0.0),
+            0.0,
+            1.0,
+        )
+        + 25.0 * _clamp(
+            _safe_div(out["body_frac"], cfg["disp_body_frac_min"], fill=0.0),
+            0.0,
+            1.0,
+        )
+        + 25.0 * _clamp(
+            _safe_div(out["vol_ratio"], cfg["vol_confirm_mult"], fill=0.0),
+            0.0,
+            1.0,
+        )
     )
     out["disp_strength_clamped"] = np.minimum(100.0, out["disp_strength"])
-    out["disp_dir"] = np.select([out["displacement_up"], out["displacement_dn"]], [1, -1], default=0)
+    out["disp_dir"] = np.select(
+        [out["displacement_up"], out["displacement_dn"]],
+        [1, -1],
+        default=0,
+    )
 
     # -------------------------------------------------------------------------
     # Premium / Discount / Equilibrium
@@ -668,7 +821,11 @@ def compute_liquidity(
         struct_fast = _ema(struct_df["close"], cfg["struct_fast_len"])
         struct_slow = _ema(struct_df["close"], cfg["struct_slow_len"])
         struct_state = pd.Series(
-            np.select([struct_fast > struct_slow, struct_fast < struct_slow], [1, -1], default=0),
+            np.select(
+                [struct_fast > struct_slow, struct_fast < struct_slow],
+                [1, -1],
+                default=0,
+            ),
             index=struct_df.index,
         )
         out["mtf_trend_state"] = struct_state.reindex(out.index, method="ffill").fillna(0).astype(int)
@@ -692,6 +849,7 @@ def compute_liquidity(
             mtf_df = mtf_frames.get(key)
             if mtf_df is None or weight <= 0:
                 continue
+
             liq_state_df = _compute_simple_liq_state(mtf_df, cfg)
             aligned = liq_state_df["liq_state"].reindex(out.index, method="ffill").fillna(0.0)
             liq_mtf_series.append(aligned)
@@ -728,20 +886,44 @@ def compute_liquidity(
         default=10.0,
     )
 
-    out["sweep_long_score"] = np.where(out["sweep_low_mem"], np.where(out["bull_quality_ok"], 100.0, 50.0), 0.0)
-    out["sweep_short_score"] = np.where(out["sweep_high_mem"], np.where(out["bear_quality_ok"], 100.0, 50.0), 0.0)
+    out["sweep_long_score"] = np.where(
+        out["sweep_low_mem"],
+        np.where(out["bull_quality_ok"], 100.0, 50.0),
+        0.0,
+    )
+    out["sweep_short_score"] = np.where(
+        out["sweep_high_mem"],
+        np.where(out["bear_quality_ok"], 100.0, 50.0),
+        0.0,
+    )
 
     out["reclaim_long_score"] = np.where(out["reclaim_low_mem"], 100.0, 0.0)
     out["reclaim_short_score"] = np.where(out["reclaim_high_mem"], 100.0, 0.0)
 
-    out["disp_long_score"] = np.where(out["displacement_up"], out["disp_strength_clamped"], out["disp_strength_clamped"] * 0.35)
-    out["disp_short_score"] = np.where(out["displacement_dn"], out["disp_strength_clamped"], out["disp_strength_clamped"] * 0.35)
+    out["disp_long_score"] = np.where(
+        out["displacement_up"],
+        out["disp_strength_clamped"],
+        out["disp_strength_clamped"] * 0.35,
+    )
+    out["disp_short_score"] = np.where(
+        out["displacement_dn"],
+        out["disp_strength_clamped"],
+        out["disp_strength_clamped"] * 0.35,
+    )
 
     out["mtf_struct_long_score"] = np.where(out["mtf_align_long"], 100.0, 0.0)
     out["mtf_struct_short_score"] = np.where(out["mtf_align_short"], 100.0, 0.0)
 
-    out["liq_mtf_long_score"] = np.where(out["liq_mtf_agreement_dir"] == 1, out["liq_mtf_agreement_score"] * 100.0, 0.0)
-    out["liq_mtf_short_score"] = np.where(out["liq_mtf_agreement_dir"] == -1, out["liq_mtf_agreement_score"] * 100.0, 0.0)
+    out["liq_mtf_long_score"] = np.where(
+        out["liq_mtf_agreement_dir"] == 1,
+        out["liq_mtf_agreement_score"] * 100.0,
+        0.0,
+    )
+    out["liq_mtf_short_score"] = np.where(
+        out["liq_mtf_agreement_dir"] == -1,
+        out["liq_mtf_agreement_score"] * 100.0,
+        0.0,
+    )
 
     out["quality_long_score"] = out["quality_score_bull"]
     out["quality_short_score"] = out["quality_score_bear"]
@@ -827,11 +1009,22 @@ def compute_liquidity(
     bear_reversal = out["liq_short_ready"] & (out["final_short_score"] >= 60.0)
     bull_breakout = out["liq_breakout_up"] & (out["final_long_score"] >= out["final_short_score"])
     bear_breakout = out["liq_breakout_dn"] & (out["final_short_score"] > out["final_long_score"])
-    bull_sweep_active = out["bull_recent"] & (out["final_long_score"] >= 45.0) & (out["liq_bias_mem"] == 1)
-    bear_sweep_active = out["bear_recent"] & (out["final_short_score"] >= 45.0) & (out["liq_bias_mem"] == -1)
+    bull_sweep_active = (
+        out["bull_recent"] & (out["final_long_score"] >= 45.0) & (out["liq_bias_mem"] == 1)
+    )
+    bear_sweep_active = (
+        out["bear_recent"] & (out["final_short_score"] >= 45.0) & (out["liq_bias_mem"] == -1)
+    )
 
     out["liq_dir"] = np.select(
-        [bull_reversal, bear_reversal, bull_breakout, bear_breakout, bull_sweep_active, bear_sweep_active],
+        [
+            bull_reversal,
+            bear_reversal,
+            bull_breakout,
+            bear_breakout,
+            bull_sweep_active,
+            bear_sweep_active,
+        ],
         [1, -1, 1, -1, 1, -1],
         default=0,
     )
@@ -849,7 +1042,11 @@ def compute_liquidity(
     out["liq_final_score"] = np.where(
         out["liq_dir"] > 0,
         out["final_long_score"],
-        np.where(out["liq_dir"] < 0, out["final_short_score"], np.maximum(out["final_long_score"], out["final_short_score"])),
+        np.where(
+            out["liq_dir"] < 0,
+            out["final_short_score"],
+            np.maximum(out["final_long_score"], out["final_short_score"]),
+        ),
     )
 
     out["active_level_price"] = np.select(
@@ -897,7 +1094,11 @@ def compute_liquidity(
     out["liq_quality_score"] = np.where(
         out["liq_dir"] > 0,
         out["quality_score_bull"],
-        np.where(out["liq_dir"] < 0, out["quality_score_bear"], np.maximum(out["quality_score_bull"], out["quality_score_bear"])),
+        np.where(
+            out["liq_dir"] < 0,
+            out["quality_score_bear"],
+            np.maximum(out["quality_score_bull"], out["quality_score_bear"]),
+        ),
     )
 
     # -------------------------------------------------------------------------
@@ -927,44 +1128,94 @@ def compute_liquidity(
 
 
 # =============================================================================
-# TEST BLOCK
+# PAYLOAD BUILDER
 # =============================================================================
 
-if __name__ == "__main__":
-    # Minimal local smoke test
-    n = 500
-    idx = pd.date_range("2026-01-01", periods=n, freq="min")
+def build_liquidity_latest_payload(
+    df: pd.DataFrame,
+    config: Optional[Dict[str, Any]] = None,
+    mtf_frames: Optional[Dict[str, pd.DataFrame]] = None,
+) -> Dict[str, Any]:
+    """
+    Build latest SmartChart Liquidity payload for website/API use.
 
-    rng = np.random.default_rng(42)
-    close = pd.Series(3300 + np.cumsum(rng.normal(0, 0.8, size=n)), index=idx)
-    open_ = close.shift(1).fillna(close.iloc[0])
-    high = np.maximum(open_, close) + rng.uniform(0.1, 1.2, size=n)
-    low = np.minimum(open_, close) - rng.uniform(0.1, 1.2, size=n)
-    volume = pd.Series(rng.integers(100, 1500, size=n), index=idx)
+    This is the single source of truth for cache + router output.
+    """
+    result = compute_liquidity(df=df, config=config, mtf_frames=mtf_frames)
 
-    test_df = pd.DataFrame(
-        {
-            "open": open_,
-            "high": high,
-            "low": low,
-            "close": close,
-            "volume": volume,
-        },
-        index=idx,
-    )
+    if result.empty:
+        raise ValueError("Liquidity build error: empty result dataframe")
 
-    result = compute_liquidity(test_df)
-    cols = [
-        "sc_liq_dir",
-        "sc_liq_state_text",
-        "sc_liq_final_score",
-        "sc_liq_quality_score",
-        "sc_liq_disp_dir",
-        "sc_liq_disp_score",
-        "sc_liq_pd_state",
-        "sc_liq_active_level",
-        "sc_liq_mtf_trend_dir",
-        "sc_liq_mtf_avg_dir",
-        "sc_liq_obos_div_state",
-    ]
-    print(result[cols].tail(10).to_string())
+    last = result.iloc[-1]
+    cfg = {**DEFAULT_LIQUIDITY_CONFIG, **(config or {})}
+
+    liq_dir = _safe_int(last.get("sc_liq_dir"), 0)
+    pd_state = _safe_int(last.get("sc_liq_pd_state"), 0)
+    obos_div_state = _safe_int(last.get("sc_liq_obos_div_state"), 0)
+    mtf_avg_dir = _safe_float(last.get("sc_liq_mtf_avg_dir"), 0.0)
+
+    payload: Dict[str, Any] = {
+        "indicator": "liquidity",
+        "name": "SmartChart Liquidity Engine",
+        "debug_version": "liquidity_payload_v1",
+        "timestamp": str(result.index[-1]),
+
+        # headline state
+        "dir": liq_dir,
+        "dir_text": _dir_text(liq_dir),
+        "state": _safe_str(last.get("sc_liq_state_text"), "neutral"),
+        "final_score": round(_safe_float(last.get("sc_liq_final_score"), 0.0), 2),
+        "quality_score": round(_safe_float(last.get("sc_liq_quality_score"), 0.0), 2),
+
+        # liquidity memory / reclaim / sweep
+        "sweep_high_mem": _safe_float(last.get("sc_liq_sweep_high_mem"), 0.0),
+        "sweep_low_mem": _safe_float(last.get("sc_liq_sweep_low_mem"), 0.0),
+        "reclaim_high_mem": _safe_float(last.get("sc_liq_reclaim_high_mem"), 0.0),
+        "reclaim_low_mem": _safe_float(last.get("sc_liq_reclaim_low_mem"), 0.0),
+        "memory_bias": _safe_int(last.get("sc_liq_memory_bias"), 0),
+        "memory_bias_text": _dir_text(_safe_int(last.get("sc_liq_memory_bias"), 0)),
+
+        # displacement
+        "disp_dir": _safe_int(last.get("sc_liq_disp_dir"), 0),
+        "disp_dir_text": _dir_text(_safe_int(last.get("sc_liq_disp_dir"), 0)),
+        "disp_score": round(_safe_float(last.get("sc_liq_disp_score"), 0.0), 2),
+
+        # PD / EQ
+        "pd_state": pd_state,
+        "pd_state_text": _pd_text(pd_state),
+
+        # active liquidity structure
+        "cluster_strength": round(_safe_float(last.get("sc_liq_cluster_strength"), 0.0), 2),
+        "active_level": round(_safe_float(last.get("sc_liq_active_level"), np.nan), 4),
+        "active_level_type": _safe_str(last.get("active_level_type"), ""),
+
+        # MTF
+        "mtf_trend_dir": _safe_int(last.get("sc_liq_mtf_trend_dir"), 0),
+        "mtf_trend_text": _dir_text(_safe_int(last.get("sc_liq_mtf_trend_dir"), 0)),
+        "mtf_avg_dir": round(mtf_avg_dir, 4),
+        "mtf_agreement_text": _agreement_text(
+            mtf_avg_dir,
+            cfg["liq_mtf_bull_thr"],
+            cfg["liq_mtf_bear_thr"],
+        ),
+
+        # OBOS + divergence
+        "obos_div_state": obos_div_state,
+        "obos_div_text": _obos_div_text(obos_div_state),
+
+        # quality internals
+        "bull_qual": _safe_int(last.get("sc_liq_bull_qual"), 0),
+        "bear_qual": _safe_int(last.get("sc_liq_bear_qual"), 0),
+
+        # useful supporting fields for Elementor / debugging
+        "final_long_score": round(_safe_float(last.get("final_long_score"), 0.0), 2),
+        "final_short_score": round(_safe_float(last.get("final_short_score"), 0.0), 2),
+        "zone_long_score": round(_safe_float(last.get("zone_long_score"), 0.0), 2),
+        "zone_short_score": round(_safe_float(last.get("zone_short_score"), 0.0), 2),
+        "liq_breakout_up": bool(last.get("liq_breakout_up", False)),
+        "liq_breakout_dn": bool(last.get("liq_breakout_dn", False)),
+        "liq_long_ready": bool(last.get("liq_long_ready", False)),
+        "liq_short_ready": bool(last.get("liq_short_ready", False)),
+    }
+
+    return payload
