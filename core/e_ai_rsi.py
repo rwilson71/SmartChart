@@ -1,21 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, asdict
+from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
 
 
 # =============================================================================
-# SMARTCHART AI RSI ENGINE v1
-# PINE AUTHORITY PARITY REBUILD
+# SMARTCHART AI RSI ENGINE v2
+# LEVEL 2 CLEAN REBUILD
+# PINE AUTHORITY LOGIC + WEBSITE JSON CONTRACT
 # =============================================================================
 # Locked build order:
 # helpers -> core engine -> base state -> MTF confirm-only layer
-# -> export fields -> debug exports -> payload builder
+# -> export fields -> payload builder
 #
-# Pine remains the source of truth.
+# Rules:
+# - Pine logic remains the authority
+# - MTF is confirm-only
+# - Core file is the single source of truth
+# - Payload builder lives inside this module
 # =============================================================================
 
 
@@ -41,22 +46,24 @@ class AiRsiConfig:
 
 
 # =============================================================================
-# HELPERS — STRICT PINE PARITY REBUILD
+# HELPERS
 # =============================================================================
+
+def _validate_ohlcv(df: pd.DataFrame) -> None:
+    required = {"open", "high", "low", "close", "volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"AI RSI engine missing required columns: {sorted(missing)}")
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError("AI RSI engine requires a DatetimeIndex for MTF parity.")
+
 
 def _series(src: pd.Series | np.ndarray | list[float], index=None) -> pd.Series:
     s = pd.Series(src, copy=False)
     if index is not None and not s.index.equals(index):
         s = pd.Series(s.to_numpy(), index=index, dtype=float)
     return s.astype(float)
-
-
-def _nz_series(src: pd.Series, replacement: float = 0.0) -> pd.Series:
-    return _series(src).fillna(replacement)
-
-
-def _nz_scalar(value: Any, replacement: float = 0.0) -> float:
-    return replacement if pd.isna(value) else float(value)
 
 
 def _sma(src: pd.Series, length: int) -> pd.Series:
@@ -66,15 +73,10 @@ def _sma(src: pd.Series, length: int) -> pd.Series:
 
 def _stdev(src: pd.Series, length: int) -> pd.Series:
     src = _series(src)
-    # Pine parity work: population stdev
     return src.rolling(length, min_periods=length).std(ddof=0)
 
 
 def _rma(src: pd.Series, length: int) -> pd.Series:
-    """
-    Pine parity for ta.rma(src, length)
-    Seed = SMA(length), then recursive alpha = 1/length
-    """
     src = _series(src)
     out = pd.Series(np.nan, index=src.index, dtype=float)
 
@@ -103,9 +105,6 @@ def _rma(src: pd.Series, length: int) -> pd.Series:
 
 
 def _rsi(close: pd.Series, length: int) -> pd.Series:
-    """
-    Pine parity target for ta.rsi(close, length)
-    """
     close = _series(close)
     delta = close.diff()
 
@@ -118,7 +117,6 @@ def _rsi(close: pd.Series, length: int) -> pd.Series:
     rs = avg_up / avg_down
     rsi = 100.0 - (100.0 / (1.0 + rs))
 
-    # Practical Pine-style guards for zero-loss / zero-gain windows
     rsi = rsi.mask((avg_down == 0) & (avg_up > 0), 100.0)
     rsi = rsi.mask((avg_up == 0) & (avg_down > 0), 0.0)
     rsi = rsi.mask((avg_up == 0) & (avg_down == 0), 0.0)
@@ -126,67 +124,39 @@ def _rsi(close: pd.Series, length: int) -> pd.Series:
     return rsi
 
 
-def _atr(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    length: int,
-) -> pd.Series:
-    """
-    Pine parity for ta.atr(length)
-    """
+def _atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
     high = _series(high)
     low = _series(low)
     close = _series(close)
 
     prev_close = close.shift(1)
-
     tr1 = high - low
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
-
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
     return _rma(tr, length)
 
 
 def _safe_log_ratio(a: pd.Series, b: pd.Series) -> pd.Series:
-    """
-    Pine parity helper for:
-        math.log(a / nz(b, a))
-
-    Safe handling:
-    - if b is NaN, replace with a
-    - if denominator <= 0 or numerator <= 0, return 0.0
-    """
     a = _series(a)
     b = _series(b, index=a.index)
 
     denom = b.fillna(a)
-
     out = pd.Series(0.0, index=a.index, dtype=float)
+
     valid = (a > 0) & (denom > 0)
     out.loc[valid] = np.log(a.loc[valid] / denom.loc[valid])
-
     return out
 
 
 def _rolling_corr(a: pd.Series, b: pd.Series, length: int) -> pd.Series:
-    """
-    Pine parity target for ta.correlation(a, b, length)
-    """
     a = _series(a)
     b = _series(b, index=a.index)
     return a.rolling(length, min_periods=length).corr(b)
 
 
 def _zscore(src: pd.Series, length: int) -> pd.Series:
-    """
-    Pine parity for:
-        f_z(src, len) =>
-            m = ta.sma(src, len)
-            s = ta.stdev(src, len)
-            s > 0 ? (src - m) / s : 0.0
-    """
     src = _series(src)
     mean = _sma(src, length)
     std = _stdev(src, length)
@@ -198,15 +168,6 @@ def _zscore(src: pd.Series, length: int) -> pd.Series:
 
 
 def _topk_indices(values: list[float], k: int = 5) -> list[int]:
-    """
-    Pine parity for f_topk_indices(arr)
-
-    Behavior:
-    - kk = min(5, len(values))
-    - nz() behavior for NaNs
-    - stable first-max wins on ties
-    - chosen slot invalidated after selection
-    """
     sz = len(values)
     if sz == 0:
         return []
@@ -235,9 +196,9 @@ def _topk_indices(values: list[float], k: int = 5) -> list[int]:
 def _pred(top_idx: list[int], coef_arr: list[float], feat_arr: list[float]) -> float:
     total = 0.0
     for idx in top_idx:
-        c = coef_arr[idx]
-        z = feat_arr[idx]
-        total += _nz_scalar(c, 0.0) * _nz_scalar(z, 0.0)
+        c = 0.0 if pd.isna(coef_arr[idx]) else float(coef_arr[idx])
+        z = 0.0 if pd.isna(feat_arr[idx]) else float(feat_arr[idx])
+        total += c * z
     return float(total)
 
 
@@ -263,13 +224,10 @@ def _tf_to_pandas_rule(tf: str) -> str:
     if tf in mapping:
         return mapping[tf]
 
-    raise ValueError(f"Unsupported timeframe for parity mapping: {tf}")
+    raise ValueError(f"Unsupported timeframe for AI RSI parity mapping: {tf}")
 
 
 def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise TypeError("DataFrame index must be a DatetimeIndex for MTF parity.")
-
     agg = {
         "open": "first",
         "high": "max",
@@ -291,25 +249,68 @@ def _dir_from_signal(sig: pd.Series) -> pd.Series:
     return out
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(v):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if pd.isna(v):
+            return default
+        return int(v)
+    except Exception:
+        return default
+
+
+def _dir_text(v: float) -> str:
+    if v > 0:
+        return "BULLISH"
+    if v < 0:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _mtf_strength_text(v: float) -> str:
+    if v > 0.6:
+        return "STRONG BULL"
+    if v > 0.2:
+        return "BULL"
+    if v < -0.6:
+        return "STRONG BEAR"
+    if v < -0.2:
+        return "BEAR"
+    return "NEUTRAL"
+
+
+def _state_text(direction: float, strength: float, neutral: bool) -> str:
+    if neutral:
+        return "NEUTRAL"
+    if direction > 0 and strength >= 0.8:
+        return "STRONG BULLISH"
+    if direction > 0:
+        return "BULLISH"
+    if direction < 0 and strength >= 0.8:
+        return "STRONG BEARISH"
+    if direction < 0:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
 # =============================================================================
-# CORE AI RSI ENGINE — PARITY LOGIC
+# CORE ENGINE
 # =============================================================================
 
 def compute_ai_rsi_core(
     df: pd.DataFrame,
     config: AiRsiConfig | None = None,
 ) -> pd.DataFrame:
-    """
-    Strict Pine-authority rebuild of the AI RSI core block.
-
-    Required columns:
-    - open
-    - high
-    - low
-    - close
-    - volume
-    """
     config = config or AiRsiConfig()
+    _validate_ohlcv(df)
 
     out = df.copy()
 
@@ -318,43 +319,20 @@ def compute_ai_rsi_core(
     low = _series(out["low"], index=close.index)
     vol = _series(out["volume"], index=close.index)
 
-    # -------------------------------------------------------------------------
-    # Per-bar features
-    # Pine:
-    # retLog    = math.log(close / nz(close[1], close))
-    # rsiVal    = ta.rsi(close, rsiLen)
-    # atrPct    = ta.atr(200) / close
-    # vol       = volume
-    # volLogChg = math.log(vol / nz(vol[1], vol))
-    # -------------------------------------------------------------------------
     ret_log = _safe_log_ratio(close, close.shift(1))
     rsi_val = _rsi(close, config.rsi_len)
-    atr_pct = _atr(high, low, close, 200) / close
+    atr_pct = _atr(high, low, close, 200) / close.replace(0, np.nan)
+    atr_pct = atr_pct.fillna(0.0)
     vol_log_chg = _safe_log_ratio(vol, vol.shift(1))
 
     out["retLog"] = ret_log
     out["rsiVal"] = rsi_val
     out["atrPct"] = atr_pct
-    out["vol"] = vol
     out["volLogChg"] = vol_log_chg
 
-    # -------------------------------------------------------------------------
-    # Target
-    # Pine:
-    # y_rsi = rsiVal[1]
-    # -------------------------------------------------------------------------
     y_rsi = rsi_val.shift(1)
     out["y_rsi"] = y_rsi
 
-    # -------------------------------------------------------------------------
-    # Predictors
-    # Pine:
-    # x_ret  = nz(retLog[1])
-    # x_rsi  = nz(rsiVal[1])
-    # x_atrp = nz(atrPct[1])
-    # x_vchg = nz(volLogChg[1])
-    # x_vol  = nz(vol[1])
-    # -------------------------------------------------------------------------
     x_ret = ret_log.shift(1).fillna(0.0)
     x_rsi = rsi_val.shift(1).fillna(0.0)
     x_atrp = atr_pct.shift(1).fillna(0.0)
@@ -367,31 +345,23 @@ def compute_ai_rsi_core(
     out["x_vchg"] = x_vchg
     out["x_vol"] = x_vol
 
-    # -------------------------------------------------------------------------
-    # Feature selection via rolling correlations
-    # Pine:
-    # corrs_abs_ret  = math.abs(nz(f_corr(y_rsi, x_ret,  learnLen)))
-    # ...
-    # corrs  = array.from(...)
-    # topIdx = f_topk_indices(corrs)
-    # -------------------------------------------------------------------------
     corr_ret = _rolling_corr(y_rsi, x_ret, config.learn_len)
     corr_rsi = _rolling_corr(y_rsi, x_rsi, config.learn_len)
     corr_atrp = _rolling_corr(y_rsi, x_atrp, config.learn_len)
     corr_vchg = _rolling_corr(y_rsi, x_vchg, config.learn_len)
     corr_vol = _rolling_corr(y_rsi, x_vol, config.learn_len)
 
-    out["coef_ret_raw"] = corr_ret
-    out["coef_rsi_raw"] = corr_rsi
-    out["coef_atrp_raw"] = corr_atrp
-    out["coef_vchg_raw"] = corr_vchg
-    out["coef_vol_raw"] = corr_vol
-
     corrs_abs_ret = corr_ret.fillna(0.0).abs()
     corrs_abs_rsi = corr_rsi.fillna(0.0).abs()
     corrs_abs_atrp = corr_atrp.fillna(0.0).abs()
     corrs_abs_vchg = corr_vchg.fillna(0.0).abs()
     corrs_abs_vol = corr_vol.fillna(0.0).abs()
+
+    out["coef_ret_raw"] = corr_ret
+    out["coef_rsi_raw"] = corr_rsi
+    out["coef_atrp_raw"] = corr_atrp
+    out["coef_vchg_raw"] = corr_vchg
+    out["coef_vol_raw"] = corr_vol
 
     out["corrs_abs_ret"] = corrs_abs_ret
     out["corrs_abs_rsi"] = corrs_abs_rsi
@@ -427,13 +397,6 @@ def compute_ai_rsi_core(
     out["topIdx_3"] = top_idx_3
     out["topIdx_4"] = top_idx_4
 
-    # -------------------------------------------------------------------------
-    # Z-scored feature levels
-    # Pine:
-    # xz_ret  = nz(f_z(x_ret,  learnLen))
-    # ...
-    # featZ   = array.from(...)
-    # -------------------------------------------------------------------------
     xz_ret = _zscore(x_ret, config.learn_len).fillna(0.0)
     xz_rsi = _zscore(x_rsi, config.learn_len).fillna(0.0)
     xz_atrp = _zscore(x_atrp, config.learn_len).fillna(0.0)
@@ -446,15 +409,6 @@ def compute_ai_rsi_core(
     out["xz_vchg"] = xz_vchg
     out["xz_vol"] = xz_vol
 
-    # -------------------------------------------------------------------------
-    # Signed coefficients
-    # Pine:
-    # coef_ret  = nz(f_corr(y_rsi, x_ret,  learnLen))
-    # coef_rsi  = 1.0
-    # coef_atrp = nz(f_corr(y_rsi, x_atrp, learnLen))
-    # coef_vchg = nz(f_corr(y_rsi, x_vchg, learnLen))
-    # coef_vol  = nz(f_corr(y_rsi, x_vol,  learnLen))
-    # -------------------------------------------------------------------------
     coef_ret = corr_ret.fillna(0.0)
     coef_rsi = pd.Series(1.0, index=out.index, dtype=float)
     coef_atrp = corr_atrp.fillna(0.0)
@@ -467,11 +421,6 @@ def compute_ai_rsi_core(
     out["coef_vchg"] = coef_vchg
     out["coef_vol"] = coef_vol
 
-    # -------------------------------------------------------------------------
-    # Prediction
-    # Pine:
-    # pred_rsi_z = f_pred(topIdx, coef, featZ)
-    # -------------------------------------------------------------------------
     pred_rsi_z: list[float] = []
 
     for i in range(len(out)):
@@ -504,13 +453,6 @@ def compute_ai_rsi_core(
     pred_rsi_z = pd.Series(pred_rsi_z, index=out.index, dtype=float)
     out["pred_rsi_z"] = pred_rsi_z
 
-    # -------------------------------------------------------------------------
-    # Map prediction back into RSI space
-    # Pine:
-    # rsi_mean = ta.sma(y_rsi, learnLen)
-    # rsi_std  = ta.stdev(y_rsi, learnLen)
-    # pred_rsi = nz(rsi_mean) + nz(rsi_std) * pred_rsi_z
-    # -------------------------------------------------------------------------
     rsi_mean = _sma(y_rsi, config.learn_len)
     rsi_std = _stdev(y_rsi, config.learn_len)
     pred_rsi = rsi_mean.fillna(0.0) + rsi_std.fillna(0.0) * pred_rsi_z
@@ -519,12 +461,6 @@ def compute_ai_rsi_core(
     out["rsi_std"] = rsi_std
     out["pred_rsi"] = pred_rsi
 
-    # -------------------------------------------------------------------------
-    # Final AI-weighted RSI
-    # Pine:
-    # rsiWeight = math.max(-2.0, math.min(2.0, (50.0 - nz(pred_rsi)) / 50.0)) * -1.0
-    # ma_rsi    = ta.sma(rsiWeight, sigLen)
-    # -------------------------------------------------------------------------
     rsi_weight = ((50.0 - pred_rsi.fillna(0.0)) / 50.0).clip(-2.0, 2.0) * -1.0
     ma_rsi = _sma(rsi_weight, config.sig_len)
 
@@ -535,7 +471,7 @@ def compute_ai_rsi_core(
 
 
 # =============================================================================
-# BASE ENGINE STATE
+# BASE STATE
 # =============================================================================
 
 def apply_ai_rsi_base_state(
@@ -543,8 +479,8 @@ def apply_ai_rsi_base_state(
     config: AiRsiConfig | None = None,
 ) -> pd.DataFrame:
     config = config or AiRsiConfig()
-
     out = df.copy()
+
     ma_rsi = _series(out["ma_rsi"])
 
     ai_dead_zone = pd.Series(
@@ -562,15 +498,10 @@ def apply_ai_rsi_base_state(
     ai_dir = ai_dir.mask((~ai_neutral) & (ma_rsi < 0), -1.0)
     out["aiDir"] = ai_dir
 
-    ai_bull = (~ai_neutral) & (ma_rsi > 0)
-    ai_bear = (~ai_neutral) & (ma_rsi < 0)
-    out["aiBull"] = ai_bull
-    out["aiBear"] = ai_bear
-
-    ai_strong_bull = ma_rsi > 0.5
-    ai_strong_bear = ma_rsi < -0.5
-    out["aiStrongBull"] = ai_strong_bull
-    out["aiStrongBear"] = ai_strong_bear
+    out["aiBull"] = (~ai_neutral) & (ma_rsi > 0)
+    out["aiBear"] = (~ai_neutral) & (ma_rsi < 0)
+    out["aiStrongBull"] = ma_rsi > 0.5
+    out["aiStrongBear"] = ma_rsi < -0.5
 
     ai_strength_score = (ma_rsi.abs() / 0.5).clip(upper=1.0)
     ai_strength_score = ai_strength_score.mask(ai_neutral, 0.0)
@@ -580,7 +511,7 @@ def apply_ai_rsi_base_state(
 
 
 # =============================================================================
-# MTF AGREEMENT LAYER — CONFIRM ONLY
+# MTF CONFIRM-ONLY LAYER
 # =============================================================================
 
 def _compute_single_mtf_dir(
@@ -588,20 +519,11 @@ def _compute_single_mtf_dir(
     tf: str,
     config: AiRsiConfig,
 ) -> pd.Series:
-    """
-    Python parity replacement for Pine:
-        request.security(syminfo.tickerid, tf, ma_rsi > 0 ? 1.0 : ma_rsi < 0 ? -1.0 : 0.0)
-
-    Process:
-    1. Resample OHLCV to target TF
-    2. Recompute AI RSI core on that TF
-    3. Convert HTF ma_rsi to 1 / -1 / 0
-    4. Forward-fill back to base timeframe
-    """
     rule = _tf_to_pandas_rule(tf)
     htf = _resample_ohlcv(df[["open", "high", "low", "close", "volume"]], rule)
 
     htf = compute_ai_rsi_core(htf, config=config)
+    htf = apply_ai_rsi_base_state(htf, config=config)
     htf_dir = _dir_from_signal(htf["ma_rsi"])
 
     base_dir = htf_dir.reindex(df.index, method="ffill").fillna(0.0)
@@ -613,28 +535,16 @@ def apply_ai_rsi_mtf_layer(
     config: AiRsiConfig | None = None,
 ) -> pd.DataFrame:
     config = config or AiRsiConfig()
-
     out = df.copy()
 
     if "aiDir" not in out.columns:
-        raise ValueError("apply_ai_rsi_mtf_layer requires 'aiDir' from base state block.")
+        raise ValueError("apply_ai_rsi_mtf_layer requires aiDir from base state.")
 
     if not config.mtf_on:
-        out["mtf1"] = 0.0
-        out["mtf2"] = 0.0
-        out["mtf3"] = 0.0
-        out["mtf4"] = 0.0
-        out["mtf5"] = 0.0
-        out["mtfSum"] = 0.0
-        out["mtfAvg"] = 0.0
-        out["mtfStrongBull"] = False
-        out["mtfBull"] = False
-        out["mtfStrongBear"] = False
-        out["mtfBear"] = False
-        out["aiMtfStrength"] = 0.0
-        out["mtfAlignedBull"] = False
-        out["mtfAlignedBear"] = False
-        out["mtfConflict"] = False
+        for col in ["mtf1", "mtf2", "mtf3", "mtf4", "mtf5", "mtfSum", "mtfAvg", "aiMtfStrength"]:
+            out[col] = 0.0
+        for col in ["mtfStrongBull", "mtfBull", "mtfStrongBear", "mtfBear", "mtfAlignedBull", "mtfAlignedBear", "mtfConflict"]:
+            out[col] = False
         return out
 
     mtf1 = _compute_single_mtf_dir(out, config.tf1, config)
@@ -654,12 +564,10 @@ def apply_ai_rsi_mtf_layer(
 
     out["mtfSum"] = mtf_sum
     out["mtfAvg"] = mtf_avg
-
     out["mtfStrongBull"] = mtf_avg > 0.6
     out["mtfBull"] = mtf_avg > 0.2
     out["mtfStrongBear"] = mtf_avg < -0.6
     out["mtfBear"] = mtf_avg < -0.2
-
     out["aiMtfStrength"] = mtf_avg.astype(float)
 
     ai_dir = _series(out["aiDir"])
@@ -671,7 +579,7 @@ def apply_ai_rsi_mtf_layer(
 
 
 # =============================================================================
-# EXPORT / PARITY VALUES
+# EXPORT FIELDS
 # =============================================================================
 
 def apply_ai_rsi_exports(df: pd.DataFrame) -> pd.DataFrame:
@@ -703,32 +611,6 @@ def apply_ai_rsi_exports(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# DEBUG / CSV PARITY EXPORTS
-# =============================================================================
-
-def apply_ai_rsi_debug_exports(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-
-    out["AI RSI Dir CSV"] = _series(out["sc_ai_rsi_dir"])
-    out["AI RSI Strength CSV"] = _series(out["sc_ai_rsi_strength"])
-    out["AI RSI Neutral CSV"] = _series(out["sc_ai_rsi_is_neutral"])
-    out["AI RSI Raw CSV"] = _series(out["sc_ai_rsi_raw"])
-    out["AI RSI Signal CSV"] = _series(out["sc_ai_rsi_signal"])
-
-    out["DBG RSI Val CSV"] = _series(out["rsiVal"])
-    out["DBG Y RSI CSV"] = _series(out["y_rsi"])
-    out["DBG X RSI CSV"] = _series(out["x_rsi"])
-    out["DBG Pred Z CSV"] = _series(out["pred_rsi_z"])
-    out["DBG RSI Mean CSV"] = _series(out["rsi_mean"])
-    out["DBG RSI Std CSV"] = _series(out["rsi_std"])
-    out["DBG Pred RSI CSV"] = _series(out["pred_rsi"])
-    out["DBG Raw CSV"] = _series(out["rsiWeight"])
-    out["DBG X RSI RAW CSV"] = _series(out["rsiVal"]).shift(1)
-
-    return out
-
-
-# =============================================================================
 # MAIN ENGINE WRAPPER
 # =============================================================================
 
@@ -737,66 +619,15 @@ def run_ai_rsi_engine(
     config: AiRsiConfig | None = None,
 ) -> pd.DataFrame:
     config = config or AiRsiConfig()
-
-    required = {"open", "high", "low", "close", "volume"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"run_ai_rsi_engine missing required columns: {sorted(missing)}")
+    _validate_ohlcv(df)
 
     out = df.copy()
-
-    if not isinstance(out.index, pd.DatetimeIndex):
-        raise TypeError("run_ai_rsi_engine requires a DatetimeIndex for MTF parity.")
-
     out = compute_ai_rsi_core(out, config=config)
     out = apply_ai_rsi_base_state(out, config=config)
     out = apply_ai_rsi_mtf_layer(out, config=config)
     out = apply_ai_rsi_exports(out)
-    out = apply_ai_rsi_debug_exports(out)
 
     return out
-
-
-# =============================================================================
-# TEXT MAPPING
-# =============================================================================
-
-def _dir_text(v: float) -> str:
-    if v > 0:
-        return "Bull"
-    if v < 0:
-        return "Bear"
-    return "Neutral"
-
-
-def _strength_text(v: float) -> str:
-    if v > 0.6:
-        return "Strong Bull"
-    if v > 0.2:
-        return "Bull"
-    if v < -0.6:
-        return "Strong Bear"
-    if v < -0.2:
-        return "Bear"
-    return "Neutral"
-
-
-def _safe_float(v: Any, default: float = 0.0) -> float:
-    try:
-        if pd.isna(v):
-            return default
-        return float(v)
-    except Exception:
-        return default
-
-
-def _safe_int(v: Any, default: int = 0) -> int:
-    try:
-        if pd.isna(v):
-            return default
-        return int(v)
-    except Exception:
-        return default
 
 
 # =============================================================================
@@ -806,11 +637,7 @@ def _safe_int(v: Any, default: int = 0) -> int:
 def build_ai_rsi_latest_payload(
     df: pd.DataFrame,
     config: AiRsiConfig | None = None,
-) -> dict[str, Any]:
-    """
-    Locked SmartChart production concept:
-    core logic + payload builder live in the same core module
-    """
+) -> Dict[str, Any]:
     config = config or AiRsiConfig()
 
     engine = run_ai_rsi_engine(df, config=config)
@@ -820,66 +647,85 @@ def build_ai_rsi_latest_payload(
     row = engine.iloc[-1]
 
     ai_dir = _safe_float(row.get("sc_ai_rsi_dir"))
+    ai_strength = _safe_float(row.get("sc_ai_rsi_strength"))
+    ai_signal = _safe_float(row.get("sc_ai_rsi_signal"))
+    ai_raw = _safe_float(row.get("sc_ai_rsi_raw"))
+    ai_dead_zone = _safe_float(row.get("sc_ai_rsi_dead_zone"))
     mtf_avg = _safe_float(row.get("sc_ai_rsi_mtf_avg"))
+    mtf_strength = _safe_float(row.get("sc_ai_rsi_mtf_strength"))
+    is_neutral = bool(_safe_int(row.get("sc_ai_rsi_is_neutral")))
 
-    payload = {
-        "engine": "AI RSI",
-        "version": "v1",
-        "category": "Momentum / AI",
+    payload: Dict[str, Any] = {
+        # ---------------------------------------------------------------------
+        # LOCKED SHARED WEBSITE CONTRACT
+        # ---------------------------------------------------------------------
         "timestamp": str(engine.index[-1]),
+        "state": _state_text(ai_dir, ai_strength, is_neutral),
+        "bias_signal": _safe_int(ai_dir),
+        "bias_label": _dir_text(ai_dir),
+        "indicator_strength": round(ai_strength, 4),
 
-        "settings": {
-            "rsi_len": config.rsi_len,
-            "sig_len": config.sig_len,
-            "learn_len": config.learn_len,
-            "dead_zone_on": config.dead_zone_on,
-            "dead_zone_val": config.dead_zone_val,
-            "mtf_on": config.mtf_on,
-            "tf1": config.tf1,
-            "tf2": config.tf2,
-            "tf3": config.tf3,
-            "tf4": config.tf4,
-            "tf5": config.tf5,
-        },
+        # ---------------------------------------------------------------------
+        # MODULE IDENTITY
+        # ---------------------------------------------------------------------
+        "engine": "AI RSI",
+        "module": "ai_rsi",
+        "version": "v2",
+        "category": "Reversal Indicators",
+        "family": "Momentum / AI",
 
-        "signal": {
-            "raw": _safe_float(row.get("sc_ai_rsi_raw")),
-            "signal": _safe_float(row.get("sc_ai_rsi_signal")),
-            "direction": _safe_int(row.get("sc_ai_rsi_dir")),
-            "direction_label": _dir_text(ai_dir),
-            "strength": _safe_float(row.get("sc_ai_rsi_strength")),
-            "dead_zone": _safe_float(row.get("sc_ai_rsi_dead_zone")),
-            "is_neutral": bool(_safe_int(row.get("sc_ai_rsi_is_neutral"))),
-            "is_bull": bool(_safe_int(row.get("sc_ai_rsi_is_bull"))),
-            "is_bear": bool(_safe_int(row.get("sc_ai_rsi_is_bear"))),
-            "is_strong_bull": bool(_safe_int(row.get("sc_ai_rsi_is_strong_bull"))),
-            "is_strong_bear": bool(_safe_int(row.get("sc_ai_rsi_is_strong_bear"))),
-        },
+        # ---------------------------------------------------------------------
+        # PRIMARY CARD FIELDS
+        # ---------------------------------------------------------------------
+        "signal_value": round(ai_signal, 6),
+        "raw_value": round(ai_raw, 6),
+        "dead_zone": round(ai_dead_zone, 6),
+        "direction": _safe_int(ai_dir),
+        "direction_label": _dir_text(ai_dir),
+
+        "is_neutral": is_neutral,
+        "is_bull": bool(_safe_int(row.get("sc_ai_rsi_is_bull"))),
+        "is_bear": bool(_safe_int(row.get("sc_ai_rsi_is_bear"))),
+        "is_strong_bull": bool(_safe_int(row.get("sc_ai_rsi_is_strong_bull"))),
+        "is_strong_bear": bool(_safe_int(row.get("sc_ai_rsi_is_strong_bear"))),
+
+        # ---------------------------------------------------------------------
+        # MTF WEBSITE FIELDS
+        # ---------------------------------------------------------------------
+        "mtf_average": round(mtf_avg, 4),
+        "mtf_strength": round(mtf_strength, 4),
+        "mtf_state": _mtf_strength_text(mtf_avg),
+        "mtf_aligned": bool(_safe_int(row.get("sc_ai_rsi_mtf_aligned"))),
+        "mtf_conflict": bool(_safe_int(row.get("sc_ai_rsi_mtf_conflict"))),
+
+        # ---------------------------------------------------------------------
+        # MODULE-SPECIFIC DETAIL
+        # ---------------------------------------------------------------------
+        "prediction_rsi": round(_safe_float(row.get("pred_rsi")), 4),
+        "prediction_z": round(_safe_float(row.get("pred_rsi_z")), 4),
+        "rsi_value": round(_safe_float(row.get("rsiVal")), 4),
+        "rsi_mean": round(_safe_float(row.get("rsi_mean")), 4),
+        "rsi_std": round(_safe_float(row.get("rsi_std")), 4),
+        "ret_log": round(_safe_float(row.get("retLog")), 6),
+        "atr_pct": round(_safe_float(row.get("atrPct")), 6),
+        "vol_log_chg": round(_safe_float(row.get("volLogChg")), 6),
 
         "mtf": {
-            "tf1": _safe_float(row.get("sc_ai_rsi_mtf_1")),
-            "tf2": _safe_float(row.get("sc_ai_rsi_mtf_2")),
-            "tf3": _safe_float(row.get("sc_ai_rsi_mtf_3")),
-            "tf4": _safe_float(row.get("sc_ai_rsi_mtf_4")),
-            "tf5": _safe_float(row.get("sc_ai_rsi_mtf_5")),
-            "average": mtf_avg,
-            "strength": _safe_float(row.get("sc_ai_rsi_mtf_strength")),
-            "state_label": _strength_text(mtf_avg),
+            "tf1": round(_safe_float(row.get("sc_ai_rsi_mtf_1")), 4),
+            "tf2": round(_safe_float(row.get("sc_ai_rsi_mtf_2")), 4),
+            "tf3": round(_safe_float(row.get("sc_ai_rsi_mtf_3")), 4),
+            "tf4": round(_safe_float(row.get("sc_ai_rsi_mtf_4")), 4),
+            "tf5": round(_safe_float(row.get("sc_ai_rsi_mtf_5")), 4),
+            "average": round(mtf_avg, 4),
+            "strength": round(mtf_strength, 4),
+            "state_label": _mtf_strength_text(mtf_avg),
             "aligned": bool(_safe_int(row.get("sc_ai_rsi_mtf_aligned"))),
             "conflict": bool(_safe_int(row.get("sc_ai_rsi_mtf_conflict"))),
         },
 
+        "settings": asdict(config),
+
         "debug": {
-            "rsi_val": _safe_float(row.get("rsiVal")),
-            "y_rsi": _safe_float(row.get("y_rsi")),
-            "x_rsi": _safe_float(row.get("x_rsi")),
-            "pred_rsi_z": _safe_float(row.get("pred_rsi_z")),
-            "rsi_mean": _safe_float(row.get("rsi_mean")),
-            "rsi_std": _safe_float(row.get("rsi_std")),
-            "pred_rsi": _safe_float(row.get("pred_rsi")),
-            "ret_log": _safe_float(row.get("retLog")),
-            "atr_pct": _safe_float(row.get("atrPct")),
-            "vol_log_chg": _safe_float(row.get("volLogChg")),
             "top_idx": [
                 _safe_int(row.get("topIdx_0")),
                 _safe_int(row.get("topIdx_1")),
@@ -887,6 +733,8 @@ def build_ai_rsi_latest_payload(
                 _safe_int(row.get("topIdx_3")),
                 _safe_int(row.get("topIdx_4")),
             ],
+            "x_rsi": round(_safe_float(row.get("x_rsi")), 4),
+            "y_rsi": round(_safe_float(row.get("y_rsi")), 4),
         },
     }
 
