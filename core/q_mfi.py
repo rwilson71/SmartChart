@@ -50,10 +50,6 @@ def _validate_ohlcv(df: pd.DataFrame) -> None:
         raise ValueError(f"Missing required OHLCV columns: {sorted(missing)}")
 
 
-def _safe_series(series: pd.Series, index: pd.Index, fill_value: float = 0.0) -> pd.Series:
-    return pd.Series(series, index=index).replace([np.inf, -np.inf], np.nan).fillna(fill_value)
-
-
 def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     agg: Dict[str, str] = {
         "high": "max",
@@ -133,6 +129,14 @@ def _sign_label(v: float) -> str:
     if v < 0:
         return "bearish"
     return "neutral"
+
+
+def _website_bias_label(signal: int) -> str:
+    if signal > 0:
+        return "BULLISH"
+    if signal < 0:
+        return "BEARISH"
+    return "NEUTRAL"
 
 
 # =============================================================================
@@ -266,6 +270,73 @@ def build_mfi_dataframe(
         default=0,
     ).astype(int)
 
+    # -------------------------------------------------------------------------
+    # WEBSITE CONTRACT LAYER
+    # -------------------------------------------------------------------------
+    # bias_signal:
+    #   strong agreement = +/-1
+    #   otherwise 0
+    out["bias_signal"] = np.where(
+        (out["mfi_direction"] > 0) & (out["mfi_signal_direction"] > 0) & (out["mfi_mtf_avg"] > 0.2),
+        1,
+        np.where(
+            (out["mfi_direction"] < 0) & (out["mfi_signal_direction"] < 0) & (out["mfi_mtf_avg"] < -0.2),
+            -1,
+            0,
+        ),
+    ).astype(int)
+
+    out["bias_label"] = out["bias_signal"].apply(_website_bias_label)
+
+    # state:
+    # preserve your internal labels, then expose one website-facing state
+    out["state"] = np.select(
+        [
+            (out["mfi_extreme_high"] == 1) & (out["bias_signal"] > 0),
+            (out["mfi_extreme_low"] == 1) & (out["bias_signal"] < 0),
+            out["bias_signal"] > 0,
+            out["bias_signal"] < 0,
+            out["mfi_extreme_high"] == 1,
+            out["mfi_extreme_low"] == 1,
+        ],
+        [
+            "BULLISH_EXTREME",
+            "BEARISH_EXTREME",
+            "BULLISH",
+            "BEARISH",
+            "EXTREME_HIGH",
+            "EXTREME_LOW",
+        ],
+        default="NEUTRAL",
+    )
+
+    # indicator_strength:
+    # weighted confidence from slow/fast displacement from mid + mtf agreement
+    slow_strength = (out["mfi_slow"] - cfg.mid_level).abs() / 50.0
+    fast_strength = (out["mfi_fast"] - cfg.mid_level).abs() / 50.0
+    mtf_strength = out["mfi_mtf_avg"].abs()
+
+    strength_raw = (slow_strength * 0.45) + (fast_strength * 0.35) + (mtf_strength * 0.20)
+    out["indicator_strength"] = (strength_raw.clip(0.0, 1.0) * 100.0).round(2)
+
+    # market_bias:
+    # user wants every indicator to expose market bias
+    out["market_bias"] = np.select(
+        [
+            out["bias_signal"] > 0,
+            out["bias_signal"] < 0,
+            out["mfi_mtf_avg"] > 0.2,
+            out["mfi_mtf_avg"] < -0.2,
+        ],
+        [
+            "BULLISH",
+            "BEARISH",
+            "BULLISH",
+            "BEARISH",
+        ],
+        default="NEUTRAL",
+    )
+
     return out
 
 
@@ -334,14 +405,27 @@ def build_mfi_latest_payload(
         "indicator": "mfi",
         "name": "SmartChart MFI Engine v1",
         "timestamp": str(ts),
-        "debug_version": "mfi_payload_v1",
+        "debug_version": "mfi_payload_v2",
         "config": asdict(cfg),
 
-        # Core values
+        # ---------------------------------------------------------------------
+        # SHARED WEBSITE CONTRACT
+        # ---------------------------------------------------------------------
+        "state": str(last.get("state", "NEUTRAL")),
+        "bias_signal": int(last.get("bias_signal", 0)),
+        "bias_label": str(last.get("bias_label", "NEUTRAL")),
+        "indicator_strength": round(float(last.get("indicator_strength", 0.0)), 2),
+        "market_bias": str(last.get("market_bias", "NEUTRAL")),
+
+        # ---------------------------------------------------------------------
+        # CORE VALUES
+        # ---------------------------------------------------------------------
         "mfi_slow": round(float(last.get("mfi_slow", 50.0)), 4),
         "mfi_fast": round(float(last.get("mfi_fast", 50.0)), 4),
 
-        # Core states
+        # ---------------------------------------------------------------------
+        # CORE STATES
+        # ---------------------------------------------------------------------
         "mfi_trend_bull": int(last.get("mfi_trend_bull", 0)),
         "mfi_trend_bear": int(last.get("mfi_trend_bear", 0)),
         "mfi_signal_bull": int(last.get("mfi_signal_bull", 0)),
@@ -349,12 +433,16 @@ def build_mfi_latest_payload(
         "mfi_extreme_high": int(last.get("mfi_extreme_high", 0)),
         "mfi_extreme_low": int(last.get("mfi_extreme_low", 0)),
 
-        # Direction / state
+        # ---------------------------------------------------------------------
+        # DIRECTION / STATE
+        # ---------------------------------------------------------------------
         "mfi_direction": int(last.get("mfi_direction", 0)),
         "mfi_signal_direction": int(last.get("mfi_signal_direction", 0)),
         "mfi_mtf_state": int(last.get("mfi_mtf_state", 0)),
 
-        # MTF components
+        # ---------------------------------------------------------------------
+        # MTF COMPONENTS
+        # ---------------------------------------------------------------------
         "mfi_mtf_1": round(float(last.get("mfi_mtf_1", 0.0)), 4),
         "mfi_mtf_2": round(float(last.get("mfi_mtf_2", 0.0)), 4),
         "mfi_mtf_3": round(float(last.get("mfi_mtf_3", 0.0)), 4),
@@ -363,7 +451,9 @@ def build_mfi_latest_payload(
         "mfi_mtf_6": round(float(last.get("mfi_mtf_6", 0.0)), 4),
         "mfi_mtf_avg": round(float(last.get("mfi_mtf_avg", 0.0)), 4),
 
-        # Text mapping
+        # ---------------------------------------------------------------------
+        # TEXT MAPPING
+        # ---------------------------------------------------------------------
         "trend_label": text["trend_label"],
         "signal_label": text["signal_label"],
         "extreme_label": text["extreme_label"],
@@ -375,32 +465,3 @@ def build_mfi_latest_payload(
     }
 
     return payload
-
-
-# =============================================================================
-# DIRECT TEST
-# =============================================================================
-
-if __name__ == "__main__":
-    rng = pd.date_range("2026-01-01", periods=1000, freq="1min")
-    np.random.seed(42)
-
-    close = pd.Series(100 + np.cumsum(np.random.normal(0, 0.15, len(rng))), index=rng)
-    open_ = close.shift(1).fillna(close.iloc[0])
-    high = pd.concat([open_, close], axis=1).max(axis=1) + np.random.uniform(0.01, 0.12, len(rng))
-    low = pd.concat([open_, close], axis=1).min(axis=1) - np.random.uniform(0.01, 0.12, len(rng))
-    volume = pd.Series(np.random.randint(100, 5000, len(rng)), index=rng)
-
-    test_df = pd.DataFrame(
-        {
-            "open": open_,
-            "high": high,
-            "low": low,
-            "close": close,
-            "volume": volume,
-        },
-        index=rng,
-    )
-
-    payload = build_mfi_latest_payload(test_df)
-    print(payload)

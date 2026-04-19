@@ -281,7 +281,8 @@ def build_fvg_dataframe(
         weight_sum = max(cfg.w1 + cfg.w2 + cfg.w3, 0.0001)
 
         for ts in out.index:
-            sub = out.loc[:ts, ["open", "high", "low", "close"] + (["volume"] if "volume" in out.columns else [])]
+            cols = ["open", "high", "low", "close"] + (["volume"] if "volume" in out.columns else [])
+            sub = out.loc[:ts, cols]
             dvals: List[Tuple[float, float]] = []
             for tf, w in tf_specs:
                 rs = _resample_ohlcv(sub, tf)
@@ -294,7 +295,7 @@ def build_fvg_dataframe(
     out["fvg_mtf_avg"] = mtf_avg_vals
 
     # Detection + state outputs
-    cols = [
+    numeric_cols = [
         "bull_raw", "bear_raw",
         "bull_gap_pct", "bear_gap_pct",
         "bull_fvg_found", "bear_fvg_found",
@@ -303,14 +304,21 @@ def build_fvg_dataframe(
         "bull_active_now", "bear_active_now",
         "bull_retest_ready", "bear_retest_ready",
         "fvg_dir", "fvg_strength_score", "fvg_state", "fvg_retest_state",
-        "fvg_state_text", "fvg_dir_text", "fvg_retest_text", "fvg_grade_text",
         "active_bull_zone_count", "active_bear_zone_count",
         "top_active_bull_top", "top_active_bull_bot", "top_active_bull_mid",
         "top_active_bear_top", "top_active_bear_bot", "top_active_bear_mid",
         "latest_bull_zone_strength", "latest_bear_zone_strength",
     ]
-    for c in cols:
+
+    text_cols = [
+        "fvg_state_text", "fvg_dir_text", "fvg_retest_text", "fvg_grade_text",
+    ]
+
+    for c in numeric_cols:
         out[c] = np.nan
+
+    for c in text_cols:
+        out[c] = pd.Series(index=out.index, dtype="object")
 
     bull_zones: List[Dict[str, Any]] = []
     bear_zones: List[Dict[str, Any]] = []
@@ -578,6 +586,34 @@ def build_fvg_dataframe(
     return out
 
 
+def _derive_market_bias(mtf_avg: float) -> str:
+    if mtf_avg > 0.20:
+        return "BULLISH"
+    if mtf_avg < -0.20:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _derive_fvg_state_label(
+    state_value: int,
+    direction_value: int,
+    retest_state: int,
+) -> str:
+    if state_value == 2:
+        return "DUAL ACTIVE FVG"
+    if state_value == 1 and direction_value == 1:
+        return "BULLISH ACTIVE FVG"
+    if state_value == 1 and direction_value == -1:
+        return "BEARISH ACTIVE FVG"
+    if retest_state == 1:
+        return "BULLISH RETEST READY"
+    if retest_state == -1:
+        return "BEARISH RETEST READY"
+    if retest_state == 2:
+        return "DUAL RETEST READY"
+    return "NO ACTIVE FVG"
+
+
 # =============================================================================
 # PAYLOAD BUILDER
 # =============================================================================
@@ -590,53 +626,79 @@ def build_fvg_latest_payload(
     out = build_fvg_dataframe(df, cfg)
     last = out.iloc[-1]
 
+    direction = int(last["fvg_dir"])
+    direction_text = str(last["fvg_dir_text"]).upper()
+    strength_score = float(last["fvg_strength_score"])
+    mtf_avg = float(last["fvg_mtf_avg"])
+    state_value = int(last["fvg_state"])
+    retest_state = int(last["fvg_retest_state"])
+
+    state_label = _derive_fvg_state_label(
+        state_value=state_value,
+        direction_value=direction,
+        retest_state=retest_state,
+    )
+
     payload: Dict[str, Any] = {
-        "module": "fvg",
+        "indicator": "fvg",
+        "debug_version": "fvg_payload_v2",
         "symbol": cfg.symbol,
         "timeframe": cfg.timeframe,
         "engine_on": cfg.fvg_on,
-        "direction": int(last["fvg_dir"]),
-        "direction_text": str(last["fvg_dir_text"]),
-        "strength_score": float(last["fvg_strength_score"]),
-        "strength_pct": float(last["fvg_strength_score"]) * 100.0,
-        "grade": str(last["fvg_grade_text"]),
-        "mtf_avg": float(last["fvg_mtf_avg"]),
-        "state": int(last["fvg_state"]),
-        "state_text": str(last["fvg_state_text"]),
-        "retest_state": int(last["fvg_retest_state"]),
-        "retest_text": str(last["fvg_retest_text"]),
-        "bull_best_score": float(last["bull_best_score"]),
-        "bear_best_score": float(last["bear_best_score"]),
-        "bull_active_now": bool(int(last["bull_active_now"])),
-        "bear_active_now": bool(int(last["bear_active_now"])),
-        "bull_retest_ready": bool(int(last["bull_retest_ready"])),
-        "bear_retest_ready": bool(int(last["bear_retest_ready"])),
-        "active_bull_zone_count": int(last["active_bull_zone_count"]),
-        "active_bear_zone_count": int(last["active_bear_zone_count"]),
-        "top_active_bull_zone": {
-            "top": None if pd.isna(last["top_active_bull_top"]) else float(last["top_active_bull_top"]),
-            "bot": None if pd.isna(last["top_active_bull_bot"]) else float(last["top_active_bull_bot"]),
-            "mid": None if pd.isna(last["top_active_bull_mid"]) else float(last["top_active_bull_mid"]),
+
+        # Shared website contract
+        "timestamp": out.index[-1].isoformat() if isinstance(out.index, pd.DatetimeIndex) else None,
+        "state": state_label,
+        "bias_signal": direction,
+        "bias_label": direction_text,
+        "indicator_strength": round(strength_score, 4),
+        "market_bias": _derive_market_bias(mtf_avg),
+
+        # Specialist FVG state
+        "state_detail": {
+            "direction": direction,
+            "direction_text": direction_text,
+            "strength_score": round(strength_score, 4),
+            "strength_pct": round(strength_score * 100.0, 2),
+            "grade": str(last["fvg_grade_text"]),
+            "mtf_avg": round(mtf_avg, 4),
+            "state_value": state_value,
+            "state_text": str(last["fvg_state_text"]),
+            "retest_state": retest_state,
+            "retest_text": str(last["fvg_retest_text"]),
+            "bull_best_score": round(float(last["bull_best_score"]), 4),
+            "bear_best_score": round(float(last["bear_best_score"]), 4),
+            "bull_active_now": bool(int(last["bull_active_now"])),
+            "bear_active_now": bool(int(last["bear_active_now"])),
+            "bull_retest_ready": bool(int(last["bull_retest_ready"])),
+            "bear_retest_ready": bool(int(last["bear_retest_ready"])),
+            "active_bull_zone_count": int(last["active_bull_zone_count"]),
+            "active_bear_zone_count": int(last["active_bear_zone_count"]),
         },
-        "top_active_bear_zone": {
-            "top": None if pd.isna(last["top_active_bear_top"]) else float(last["top_active_bear_top"]),
-            "bot": None if pd.isna(last["top_active_bear_bot"]) else float(last["top_active_bear_bot"]),
-            "mid": None if pd.isna(last["top_active_bear_mid"]) else float(last["top_active_bear_mid"]),
+
+        "zones": {
+            "top_active_bull_zone": {
+                "top": None if pd.isna(last["top_active_bull_top"]) else round(float(last["top_active_bull_top"]), 4),
+                "bot": None if pd.isna(last["top_active_bull_bot"]) else round(float(last["top_active_bull_bot"]), 4),
+                "mid": None if pd.isna(last["top_active_bull_mid"]) else round(float(last["top_active_bull_mid"]), 4),
+            },
+            "top_active_bear_zone": {
+                "top": None if pd.isna(last["top_active_bear_top"]) else round(float(last["top_active_bear_top"]), 4),
+                "bot": None if pd.isna(last["top_active_bear_bot"]) else round(float(last["top_active_bear_bot"]), 4),
+                "mid": None if pd.isna(last["top_active_bear_mid"]) else round(float(last["top_active_bear_mid"]), 4),
+            },
         },
+
         "latest_detection": {
             "bull_found": bool(int(last["bull_fvg_found"])),
             "bear_found": bool(int(last["bear_fvg_found"])),
-            "bull_gap_pct": float(last["bull_gap_pct"]) if pd.notna(last["bull_gap_pct"]) else 0.0,
-            "bear_gap_pct": float(last["bear_gap_pct"]) if pd.notna(last["bear_gap_pct"]) else 0.0,
-            "bull_base_strength": float(last["bull_base_strength"]) if pd.notna(last["bull_base_strength"]) else 0.0,
-            "bear_base_strength": float(last["bear_base_strength"]) if pd.notna(last["bear_base_strength"]) else 0.0,
+            "bull_gap_pct": round(float(last["bull_gap_pct"]), 4) if pd.notna(last["bull_gap_pct"]) else 0.0,
+            "bear_gap_pct": round(float(last["bear_gap_pct"]), 4) if pd.notna(last["bear_gap_pct"]) else 0.0,
+            "bull_base_strength": round(float(last["bull_base_strength"]), 4) if pd.notna(last["bull_base_strength"]) else 0.0,
+            "bear_base_strength": round(float(last["bear_base_strength"]), 4) if pd.notna(last["bear_base_strength"]) else 0.0,
         },
+
         "config": asdict(cfg),
     }
-
-    if isinstance(out.index, pd.DatetimeIndex):
-        payload["timestamp"] = out.index[-1].isoformat()
-    else:
-        payload["timestamp"] = None
 
     return payload

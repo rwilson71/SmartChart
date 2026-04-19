@@ -24,14 +24,56 @@ _CACHE: Dict[str, Dict[str, Any]] = {
 }
 
 
+def _fallback_payload(
+    cfg: EmaDistanceConfig,
+    message: str,
+) -> Dict[str, Any]:
+    return {
+        "module": cfg.module_name,
+        "debug_version": cfg.debug_version,
+        "ready": False,
+        "timestamp": None,
+        "state": "Transition",
+        "bias_signal": 0,
+        "bias_label": "NEUTRAL",
+        "indicator_strength": 0.0,
+        "market_bias": "NEUTRAL",
+        "stage": 0,
+        "stage_label": "Transition",
+        "distance_pct": None,
+        "distance_signed_pct": None,
+        "ema20": None,
+        "ema200": None,
+        "ema20_slope_pct": None,
+        "ema200_slope_pct": None,
+        "trend_side": 0,
+        "price_side_vs_ema20": 0,
+        "bars_in_state": 0,
+        "message": message,
+    }
+
+
 def load_price_data(data_path: Optional[Path] = None) -> pd.DataFrame:
     path = data_path or DATA_PATH
-    df = pd.read_csv(path)
+
+    if not path.exists():
+        return pd.DataFrame(columns=["open", "high", "low", "close"])
+
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame(columns=["open", "high", "low", "close"])
+
+    if df.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close"])
 
     for col in ["datetime", "timestamp", "time", "date"]:
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-            df = df.dropna(subset=[col]).set_index(col)
+            try:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+                df = df.dropna(subset=[col]).set_index(col)
+            except Exception:
+                pass
             break
 
     return df
@@ -53,8 +95,14 @@ def get_ema_distance_latest(
     ):
         return cached["payload"]
 
-    df = load_price_data()
-    payload = build_latest_payload(df, cfg)
+    try:
+        df = load_price_data()
+        payload = build_latest_payload(df, cfg)
+    except Exception as exc:
+        payload = _fallback_payload(
+            cfg,
+            f"EMA Distance cache fallback triggered: {exc}",
+        )
 
     cached["timestamp"] = now
     cached["payload"] = payload

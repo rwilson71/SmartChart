@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
+
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -36,6 +37,13 @@ class PullbackRetestConfig:
     # Fib settings
     fib_pivot_len: int = 5
 
+    # Trigger candle scoring
+    volume_ma_len: int = 20
+    displacement_atr_mult: float = 1.20
+    absorption_wick_ratio_min: float = 0.35
+    strong_close_pos_bull: float = 0.65
+    strong_close_pos_bear: float = 0.35
+
 
 # =============================================================================
 # HELPERS
@@ -51,11 +59,13 @@ def _validate_ohlcv(df: pd.DataFrame) -> None:
 
 
 def _ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
+    length = max(1, int(length))
+    return pd.to_numeric(series, errors="coerce").ewm(span=length, adjust=False).mean()
 
 
 def _sma(series: pd.Series, length: int) -> pd.Series:
-    return series.rolling(length, min_periods=1).mean()
+    length = max(1, int(length))
+    return pd.to_numeric(series, errors="coerce").rolling(length, min_periods=1).mean()
 
 
 def _atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
@@ -75,16 +85,23 @@ def _bars_since(condition: pd.Series) -> pd.Series:
     out = np.full(len(condition), np.nan, dtype=float)
     last_true = -1
     vals = condition.fillna(False).astype(bool).to_numpy()
+
     for i, flag in enumerate(vals):
         if flag:
             last_true = i
             out[i] = 0.0
         elif last_true >= 0:
             out[i] = float(i - last_true)
+
     return pd.Series(out, index=condition.index)
 
 
-def _within_tolerance(price_low: pd.Series, price_high: pd.Series, level: pd.Series, tol: pd.Series) -> pd.Series:
+def _within_tolerance(
+    price_low: pd.Series,
+    price_high: pd.Series,
+    level: pd.Series,
+    tol: pd.Series,
+) -> pd.Series:
     return (price_low <= (level + tol)) & (price_high >= (level - tol))
 
 
@@ -92,13 +109,15 @@ def _rolling_pivot_high(high: pd.Series, left: int, right: int) -> pd.Series:
     vals = high.to_numpy(dtype=float)
     n = len(vals)
     out = np.full(n, np.nan, dtype=float)
+
     for i in range(left, n - right):
         center = vals[i]
         if np.isnan(center):
             continue
-        window = vals[i - left:i + right + 1]
+        window = vals[i - left : i + right + 1]
         if np.nanargmax(window) == left and np.nanmax(window) == center:
             out[i] = center
+
     return pd.Series(out, index=high.index)
 
 
@@ -106,13 +125,15 @@ def _rolling_pivot_low(low: pd.Series, left: int, right: int) -> pd.Series:
     vals = low.to_numpy(dtype=float)
     n = len(vals)
     out = np.full(n, np.nan, dtype=float)
+
     for i in range(left, n - right):
         center = vals[i]
         if np.isnan(center):
             continue
-        window = vals[i - left:i + right + 1]
+        window = vals[i - left : i + right + 1]
         if np.nanargmin(window) == left and np.nanmin(window) == center:
             out[i] = center
+
     return pd.Series(out, index=low.index)
 
 
@@ -127,9 +148,6 @@ def _prev_daily_levels(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _first_bar_levels(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """
-    For each day, extract the first bar high/low after resampling to rule.
-    """
     agg = {
         "open": "first",
         "high": "max",
@@ -174,7 +192,11 @@ def _fib_level(direction: pd.Series, anchor_a: pd.Series, fib_range: pd.Series, 
 def _ttl_flag(raw_touch: pd.Series, ttl_bars: int) -> pd.DataFrame:
     bars = _bars_since(raw_touch)
     active = bars.notna() & (bars >= 0) & (bars <= ttl_bars)
-    ttl = pd.Series(np.where(active, np.maximum(0, ttl_bars - bars), 0), index=raw_touch.index, dtype=int)
+    ttl = pd.Series(
+        np.where(active, np.maximum(0, ttl_bars - bars), 0),
+        index=raw_touch.index,
+        dtype=int,
+    )
     return pd.DataFrame(
         {
             "touch_now": raw_touch.astype(int),
@@ -183,6 +205,49 @@ def _ttl_flag(raw_touch: pd.Series, ttl_bars: int) -> pd.DataFrame:
         },
         index=raw_touch.index,
     )
+
+
+def _safe_div(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    return (
+        numerator / denominator.replace(0.0, np.nan)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def _body_fraction(df: pd.DataFrame) -> pd.Series:
+    rng = (df["high"] - df["low"]).abs()
+    body = (df["close"] - df["open"]).abs()
+    return _safe_div(body, rng)
+
+
+def _close_position(df: pd.DataFrame) -> pd.Series:
+    rng = (df["high"] - df["low"]).abs()
+    return _safe_div(df["close"] - df["low"], rng).clip(0.0, 1.0)
+
+
+def _upper_wick(df: pd.DataFrame) -> pd.Series:
+    return (df["high"] - pd.concat([df["open"], df["close"]], axis=1).max(axis=1)).clip(lower=0.0)
+
+
+def _lower_wick(df: pd.DataFrame) -> pd.Series:
+    return (pd.concat([df["open"], df["close"]], axis=1).min(axis=1) - df["low"]).clip(lower=0.0)
+
+
+def _to_native(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    return value
 
 
 # =============================================================================
@@ -342,7 +407,6 @@ def calculate_pullback_retest(
 
     first_5m_high = first_5m["first_5min_high"]
     first_5m_low = first_5m["first_5min_low"]
-
     first_15m_high = first_15m["first_15min_high"]
     first_15m_low = first_15m["first_15min_low"]
 
@@ -428,19 +492,31 @@ def calculate_pullback_retest(
     bear_fib_ready = prev_day_high_s.notna() & last_pivot_low.notna() & (last_pivot_low < prev_day_high_s)
 
     fib_a = pd.Series(
-        np.where(trend_dir == 1, prev_day_low_s, np.where(trend_dir == -1, prev_day_high_s, np.nan)),
+        np.where(
+            trend_dir == 1,
+            prev_day_low_s,
+            np.where(trend_dir == -1, prev_day_high_s, np.nan),
+        ),
         index=base.index,
         dtype=float,
     )
     fib_b = pd.Series(
-        np.where(trend_dir == 1, last_pivot_high, np.where(trend_dir == -1, last_pivot_low, np.nan)),
+        np.where(
+            trend_dir == 1,
+            last_pivot_high,
+            np.where(trend_dir == -1, last_pivot_low, np.nan),
+        ),
         index=base.index,
         dtype=float,
     )
 
     fib_range = (fib_b - fib_a).abs()
     fib_ready = pd.Series(
-        np.where(trend_dir == 1, bull_fib_ready, np.where(trend_dir == -1, bear_fib_ready, False)),
+        np.where(
+            trend_dir == 1,
+            bull_fib_ready,
+            np.where(trend_dir == -1, bear_fib_ready, False),
+        ),
         index=base.index,
         dtype=bool,
     )
@@ -512,6 +588,131 @@ def calculate_pullback_retest(
     ).astype(int)
 
     # -------------------------------------------------------------------------
+    # TRIGGER CANDLE SCORING (OHLCV / FOOTPRINT PROXY)
+    # -------------------------------------------------------------------------
+    candle_range = (base["high"] - base["low"]).abs()
+    body_frac = _body_fraction(base)
+    close_pos = _close_position(base)
+
+    upper_wick = _upper_wick(base)
+    lower_wick = _lower_wick(base)
+
+    vol_ma = _sma(base["volume"], cfg.volume_ma_len)
+    rel_volume = _safe_div(base["volume"], vol_ma).clip(0.0, 3.0)
+
+    signed_pressure = np.sign(base["close"] - base["open"])
+    delta_proxy_raw = signed_pressure * body_frac * rel_volume
+    delta_strength = pd.Series(delta_proxy_raw, index=base.index, dtype=float).clip(-3.0, 3.0)
+
+    displacement_flag = (
+        (candle_range >= (out["atr_now"] * cfg.displacement_atr_mult))
+        & (body_frac >= 0.60)
+        & (rel_volume >= 1.10)
+    ).astype(int)
+
+    displacement_score = (
+        (_safe_div(candle_range, out["atr_now"]).clip(0.0, 3.0) / 3.0) * 0.50
+        + body_frac.clip(0.0, 1.0) * 0.30
+        + (rel_volume.clip(0.0, 3.0) / 3.0) * 0.20
+    ).clip(0.0, 1.0)
+
+    wick_ratio_lower = _safe_div(lower_wick, candle_range).clip(0.0, 1.0)
+    wick_ratio_upper = _safe_div(upper_wick, candle_range).clip(0.0, 1.0)
+
+    bull_absorption_flag = (
+        (wick_ratio_lower >= cfg.absorption_wick_ratio_min)
+        & (close_pos >= 0.50)
+        & (rel_volume >= 1.0)
+    ).astype(int)
+
+    bear_absorption_flag = (
+        (wick_ratio_upper >= cfg.absorption_wick_ratio_min)
+        & (close_pos <= 0.50)
+        & (rel_volume >= 1.0)
+    ).astype(int)
+
+    bull_absorption_score = (
+        wick_ratio_lower * 0.45
+        + close_pos.clip(0.0, 1.0) * 0.30
+        + (rel_volume.clip(0.0, 3.0) / 3.0) * 0.25
+    ).clip(0.0, 1.0)
+
+    bear_absorption_score = (
+        wick_ratio_upper * 0.45
+        + (1.0 - close_pos.clip(0.0, 1.0)) * 0.30
+        + (rel_volume.clip(0.0, 3.0) / 3.0) * 0.25
+    ).clip(0.0, 1.0)
+
+    bull_score = (
+        (delta_strength.clip(lower=0.0, upper=3.0) / 3.0) * 0.35
+        + close_pos.clip(0.0, 1.0) * 0.20
+        + body_frac.clip(0.0, 1.0) * 0.15
+        + bull_absorption_score * 0.15
+        + displacement_score * 0.15
+    ).clip(0.0, 1.0)
+
+    bear_score = (
+        ((-delta_strength).clip(lower=0.0, upper=3.0) / 3.0) * 0.35
+        + (1.0 - close_pos.clip(0.0, 1.0)) * 0.20
+        + body_frac.clip(0.0, 1.0) * 0.15
+        + bear_absorption_score * 0.15
+        + displacement_score * 0.15
+    ).clip(0.0, 1.0)
+
+    final_trigger_score = pd.Series(
+        np.where(
+            trend_dir > 0,
+            bull_score,
+            np.where(
+                trend_dir < 0,
+                bear_score,
+                np.maximum(bull_score, bear_score),
+            ),
+        ),
+        index=base.index,
+        dtype=float,
+    ).clip(0.0, 1.0)
+
+    trigger_bias = pd.Series(
+        np.where(
+            bull_score > bear_score,
+            1,
+            np.where(bear_score > bull_score, -1, 0),
+        ),
+        index=base.index,
+        dtype=int,
+    )
+
+    trigger_bias_label = pd.Series(
+        np.where(
+            trigger_bias > 0,
+            "bullish",
+            np.where(trigger_bias < 0, "bearish", "neutral"),
+        ),
+        index=base.index,
+        dtype="object",
+    )
+
+    out["trigger_body_frac"] = body_frac.astype(float)
+    out["trigger_close_pos"] = close_pos.astype(float)
+    out["trigger_rel_volume"] = rel_volume.astype(float)
+    out["trigger_delta_strength"] = delta_strength.astype(float)
+
+    out["trigger_displacement_flag"] = displacement_flag.astype(int)
+    out["trigger_displacement_score"] = displacement_score.astype(float)
+
+    out["trigger_bull_absorption_flag"] = bull_absorption_flag.astype(int)
+    out["trigger_bear_absorption_flag"] = bear_absorption_flag.astype(int)
+    out["trigger_bull_absorption_score"] = bull_absorption_score.astype(float)
+    out["trigger_bear_absorption_score"] = bear_absorption_score.astype(float)
+
+    out["trigger_bull_score"] = bull_score.astype(float)
+    out["trigger_bear_score"] = bear_score.astype(float)
+    out["trigger_final_score"] = final_trigger_score.astype(float)
+    out["trigger_bias"] = trigger_bias.astype(int)
+    out["trigger_bias_label"] = trigger_bias_label
+
+    # -------------------------------------------------------------------------
     # EXPORT CONTRACT
     # -------------------------------------------------------------------------
     export_cols = [
@@ -544,8 +745,8 @@ def calculate_pullback_retest(
         out[f"{col}_export"] = out[col].astype(int)
 
     out["pb_direction"] = trend_dir.astype(int)
-    out["pb_signal"] = out["rt_any"].astype(int)
-    out["pb_strength"] = (
+
+    retest_family_strength = (
         out[
             [
                 "rt_any_ema",
@@ -556,90 +757,51 @@ def calculate_pullback_retest(
         ].sum(axis=1) / 4.0
     ).astype(float)
 
+    out["pb_signal"] = (
+        (out["rt_any"] == 1) & (out["trigger_final_score"] >= 0.45)
+    ).astype(int)
+
+    out["pb_strength"] = (
+        retest_family_strength * 0.55
+        + out["trigger_final_score"].clip(0.0, 1.0) * 0.45
+    ).clip(0.0, 1.0).astype(float)
+
     return out
 
 
-# =============================================================================
-# DIRECT TEST BLOCK
-# =============================================================================
-
-if __name__ == "__main__":
-    rng = pd.date_range("2026-01-01", periods=1500, freq="5min")
-    np.random.seed(42)
-
-    drift = np.linspace(0, 20, len(rng))
-    noise = np.random.normal(0, 1.0, len(rng)).cumsum()
-    close = pd.Series(3300 + drift + noise, index=rng)
-    open_ = close.shift(1).fillna(close.iloc[0])
-
-    high = pd.concat([open_, close], axis=1).max(axis=1) + np.random.uniform(0.2, 2.0, len(rng))
-    low = pd.concat([open_, close], axis=1).min(axis=1) - np.random.uniform(0.2, 2.0, len(rng))
-    volume = pd.Series(np.random.randint(100, 5000, len(rng)), index=rng)
-
-    test_df = pd.DataFrame(
-        {
-            "open": open_,
-            "high": high,
-            "low": low,
-            "close": close,
-            "volume": volume,
-        },
-        index=rng,
+def build_pullback_retest(
+    df: pd.DataFrame,
+    config: Optional[PullbackRetestConfig] = None,
+    confluence_df: Optional[pd.DataFrame] = None,
+    trend_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    return calculate_pullback_retest(
+        df=df,
+        config=config,
+        confluence_df=confluence_df,
+        trend_df=trend_df,
     )
 
-    # Mock confluence zone for test
-    mock_conf = pd.DataFrame(index=test_df.index)
-    mock_conf["conf_zone_lo_export"] = _ema(test_df["close"], 20) - 5.0
-    mock_conf["conf_zone_hi_export"] = _ema(test_df["close"], 20) + 5.0
 
-    result = calculate_pullback_retest(test_df, confluence_df=mock_conf)
+def run_pullback_retest(
+    df: pd.DataFrame,
+    config: Optional[PullbackRetestConfig] = None,
+    confluence_df: Optional[pd.DataFrame] = None,
+    trend_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    return calculate_pullback_retest(
+        df=df,
+        config=config,
+        confluence_df=confluence_df,
+        trend_df=trend_df,
+    )
 
-    cols = [
-        "pb_trend_dir",
-        "rt_ema1420_active_export",
-        "rt_ema3350_active_export",
-        "rt_ema100200_active_export",
-        "rt_conf_cloud_active_export",
-        "rt_session_high_active_export",
-        "rt_session_low_active_export",
-        "rt_prev_day_high_active_export",
-        "rt_prev_day_low_active_export",
-        "rt_first_5m_high_active_export",
-        "rt_first_5m_low_active_export",
-        "rt_first_15m_high_active_export",
-        "rt_first_15m_low_active_export",
-        "rt_fib25_active_export",
-        "rt_fib33_active_export",
-        "rt_fib50_active_export",
-        "rt_fib615_active_export",
-        "rt_fib66_active_export",
-        "rt_fib78_active_export",
-        "rt_any_ema_export",
-        "rt_any_structure_export",
-        "rt_any_fib_export",
-        "rt_any_cloud_export",
-        "rt_any_export",
-        "pb_signal",
-        "pb_strength",
-    ]
 
-    # =============================================================================
+# =============================================================================
 # PAYLOAD BUILDER
 # =============================================================================
 
 DEFAULT_PULLBACK_RETEST_CONFIG: Dict[str, Any] = asdict(PullbackRetestConfig())
-
-
-def _to_native(value: Any) -> Any:
-    if pd.isna(value):
-        return None
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        return float(value)
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-    return value
 
 
 def build_pullback_retest_latest_payload(
@@ -648,9 +810,6 @@ def build_pullback_retest_latest_payload(
     confluence_df: Optional[pd.DataFrame] = None,
     trend_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
-    """
-    Build website/API payload for the latest Pullback / Retest state.
-    """
     cfg_dict = DEFAULT_PULLBACK_RETEST_CONFIG.copy()
     if config:
         cfg_dict.update(config)
@@ -665,7 +824,7 @@ def build_pullback_retest_latest_payload(
     )
 
     if result.empty:
-        return {}
+        raise ValueError("Pullback/Retest payload build failed: empty dataframe result")
 
     last_idx = result.index[-1]
     last = result.iloc[-1]
@@ -673,6 +832,9 @@ def build_pullback_retest_latest_payload(
     direction = int(_to_native(last.get("pb_direction", 0)) or 0)
     signal = int(_to_native(last.get("pb_signal", 0)) or 0)
     strength = float(_to_native(last.get("pb_strength", 0.0)) or 0.0)
+
+    trigger_bias = int(_to_native(last.get("trigger_bias", 0)) or 0)
+    trigger_bias_label = str(_to_native(last.get("trigger_bias_label")) or "neutral")
 
     if direction > 0:
         direction_label = "bullish"
@@ -700,17 +862,56 @@ def build_pullback_retest_latest_payload(
     else:
         state_label = "no_retest"
 
+    bias_signal = direction if signal == 1 else 0
+    if bias_signal > 0:
+        bias_label = "BULLISH"
+    elif bias_signal < 0:
+        bias_label = "BEARISH"
+    else:
+        bias_label = "NEUTRAL"
+
+    if signal == 1:
+        market_bias = bias_label
+    else:
+        market_bias = "NEUTRAL"
+
     payload = {
         "indicator": "pullback_retest",
+        "debug_version": "pullback_retest_payload_v2",
         "timestamp": last_idx.isoformat(),
-        "state": {
-            "direction": direction,
-            "direction_label": direction_label,
-            "signal": signal,
-            "strength": round(strength, 4),
-            "state_label": state_label,
-            "active_groups": active_groups,
-        },
+
+        # Shared website / Ultimate Truth contract
+        "state": state_label,
+        "bias_signal": bias_signal,
+        "bias_label": bias_label,
+        "indicator_strength": round(strength, 4),
+        "market_bias": market_bias,
+
+        # Specialist state
+        "direction": direction,
+        "direction_label": direction_label,
+        "signal": signal,
+        "strength": round(strength, 4),
+        "state_label": state_label,
+        "active_groups": active_groups,
+
+        # Trigger candle specialist fields
+        "trigger_delta_strength": round(float(_to_native(last.get("trigger_delta_strength", 0.0)) or 0.0), 4),
+        "trigger_bull_score": round(float(_to_native(last.get("trigger_bull_score", 0.0)) or 0.0), 4),
+        "trigger_bear_score": round(float(_to_native(last.get("trigger_bear_score", 0.0)) or 0.0), 4),
+        "trigger_final_score": round(float(_to_native(last.get("trigger_final_score", 0.0)) or 0.0), 4),
+        "trigger_bias": trigger_bias,
+        "trigger_bias_label": trigger_bias_label,
+        "trigger_displacement_flag": int(_to_native(last.get("trigger_displacement_flag", 0)) or 0),
+        "trigger_displacement_score": round(float(_to_native(last.get("trigger_displacement_score", 0.0)) or 0.0), 4),
+        "trigger_bull_absorption_flag": int(_to_native(last.get("trigger_bull_absorption_flag", 0)) or 0),
+        "trigger_bear_absorption_flag": int(_to_native(last.get("trigger_bear_absorption_flag", 0)) or 0),
+        "trigger_bull_absorption_score": round(float(_to_native(last.get("trigger_bull_absorption_score", 0.0)) or 0.0), 4),
+        "trigger_bear_absorption_score": round(float(_to_native(last.get("trigger_bear_absorption_score", 0.0)) or 0.0), 4),
+        "trigger_body_frac": round(float(_to_native(last.get("trigger_body_frac", 0.0)) or 0.0), 4),
+        "trigger_close_pos": round(float(_to_native(last.get("trigger_close_pos", 0.0)) or 0.0), 4),
+        "trigger_rel_volume": round(float(_to_native(last.get("trigger_rel_volume", 0.0)) or 0.0), 4),
+
         "levels": {
             "ema14": _to_native(last.get("ema14")),
             "ema20": _to_native(last.get("ema20")),
@@ -738,6 +939,7 @@ def build_pullback_retest_latest_payload(
             "atr_now": _to_native(last.get("atr_now")),
             "retest_tolerance": _to_native(last.get("retest_tolerance")),
         },
+
         "retests": {
             "ema": {
                 "ema1420": {
@@ -823,34 +1025,11 @@ def build_pullback_retest_latest_payload(
             },
             "any": int(_to_native(last.get("rt_any_export", 0)) or 0),
         },
-        "exports": {
-            "pb_direction": direction,
-            "pb_signal": signal,
-            "pb_strength": round(strength, 4),
-            "rt_ema1420_active_export": int(_to_native(last.get("rt_ema1420_active_export", 0)) or 0),
-            "rt_ema3350_active_export": int(_to_native(last.get("rt_ema3350_active_export", 0)) or 0),
-            "rt_ema100200_active_export": int(_to_native(last.get("rt_ema100200_active_export", 0)) or 0),
-            "rt_conf_cloud_active_export": int(_to_native(last.get("rt_conf_cloud_active_export", 0)) or 0),
-            "rt_session_high_active_export": int(_to_native(last.get("rt_session_high_active_export", 0)) or 0),
-            "rt_session_low_active_export": int(_to_native(last.get("rt_session_low_active_export", 0)) or 0),
-            "rt_prev_day_high_active_export": int(_to_native(last.get("rt_prev_day_high_active_export", 0)) or 0),
-            "rt_prev_day_low_active_export": int(_to_native(last.get("rt_prev_day_low_active_export", 0)) or 0),
-            "rt_first_5m_high_active_export": int(_to_native(last.get("rt_first_5m_high_active_export", 0)) or 0),
-            "rt_first_5m_low_active_export": int(_to_native(last.get("rt_first_5m_low_active_export", 0)) or 0),
-            "rt_first_15m_high_active_export": int(_to_native(last.get("rt_first_15m_high_active_export", 0)) or 0),
-            "rt_first_15m_low_active_export": int(_to_native(last.get("rt_first_15m_low_active_export", 0)) or 0),
-            "rt_fib25_active_export": int(_to_native(last.get("rt_fib25_active_export", 0)) or 0),
-            "rt_fib33_active_export": int(_to_native(last.get("rt_fib33_active_export", 0)) or 0),
-            "rt_fib50_active_export": int(_to_native(last.get("rt_fib50_active_export", 0)) or 0),
-            "rt_fib615_active_export": int(_to_native(last.get("rt_fib615_active_export", 0)) or 0),
-            "rt_fib66_active_export": int(_to_native(last.get("rt_fib66_active_export", 0)) or 0),
-            "rt_fib78_active_export": int(_to_native(last.get("rt_fib78_active_export", 0)) or 0),
-            "rt_any_ema_export": int(_to_native(last.get("rt_any_ema_export", 0)) or 0),
-            "rt_any_structure_export": int(_to_native(last.get("rt_any_structure_export", 0)) or 0),
-            "rt_any_fib_export": int(_to_native(last.get("rt_any_fib_export", 0)) or 0),
-            "rt_any_cloud_export": int(_to_native(last.get("rt_any_cloud_export", 0)) or 0),
-            "rt_any_export": int(_to_native(last.get("rt_any_export", 0)) or 0),
+
+        "price": {
+            "close": _to_native(df["close"].iloc[-1]),
         },
+
         "config": cfg_dict,
     }
 

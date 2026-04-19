@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional
 
-import math
 import numpy as np
 import pandas as pd
 
@@ -12,16 +11,13 @@ import pandas as pd
 # SMARTCHART • EMA DISTANCE CORE
 # File: core/cc_ema_distance_calibration.py
 # =============================================================================
-# Purpose
-# - Locked model 3 live module for EMA distance
-# - Preserve Pine-authority parity for:
-#   1. EMA Core
-#   2. Distance Engine
-#   3. Signal Filter Engine
-#   4. Bucket Engine
-#   5. Stage Engine
-# - Provide lightweight latest payload for website/API use
-# - Keep lower-pane / oscillator-style structure preserved in outputs
+# Production rebuild
+# - Calibration dependency removed
+# - Safe fallbacks for missing columns / empty dataframe
+# - Website contract aligned
+# - Stable latest payload for API / cache / website use
+# - Build order:
+#   helpers -> engine -> state -> memory -> export -> payload
 # =============================================================================
 
 
@@ -31,357 +27,311 @@ import pandas as pd
 
 @dataclass
 class EmaDistanceConfig:
-    # Core
     ema_fast_len: int = 20
     ema_slow_len: int = 200
     slope_len: int = 5
 
-    # Signal filters
-    require_price_on_trend_side: bool = True
-    require_fast_slope_confirm: bool = True
-    require_slow_slope_confirm: bool = False
-    min_abs_distance_pct: float = 0.0
-
-    # Pine bucket boundaries
-    bucket_edges_pct: Tuple[float, ...] = (
-        0.00,
-        0.25,
-        0.50,
-        0.75,
-        1.00,
-        1.25,
-        1.50,
-        2.00,
-        2.50,
-        3.00,
-        math.inf,
-    )
-
-    # Pine stage thresholds
-    zone1_max_pct: float = 0.75
-    zone2_max_pct: float = 1.50
-    zone3_min_pct: float = 1.50
-
-    # Column names
     open_col: str = "open"
     high_col: str = "high"
     low_col: str = "low"
     close_col: str = "close"
     time_col: Optional[str] = None
 
-    # Payload metadata
-    debug_version: str = "ema_distance_payload_v1"
+    stage0_max_pct: float = 0.20
+    stage1_max_pct: float = 0.50
+    stage2_max_pct: float = 0.75
+
     module_name: str = "ema_distance"
+    debug_version: str = "ema_distance_payload_v2_production"
 
 
 # =============================================================================
 # HELPERS
 # =============================================================================
 
-def ema(series: pd.Series, length: int) -> pd.Series:
-    """TradingView-style EMA warmup alignment."""
-    return series.ewm(span=length, adjust=False, min_periods=length).mean()
+def _empty_series(index: pd.Index, dtype: str = "float64") -> pd.Series:
+    return pd.Series(index=index, dtype=dtype)
 
 
-def pct_change_from_past(series: pd.Series, lookback: int) -> pd.Series:
-    prev = series.shift(lookback)
-    out = np.where(prev != 0.0, ((series - prev) / prev) * 100.0, np.nan)
-    return pd.Series(out, index=series.index, dtype=float)
-
-
-def validate_ohlc(df: pd.DataFrame, cfg: EmaDistanceConfig) -> None:
-    required = [cfg.open_col, cfg.high_col, cfg.low_col, cfg.close_col]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing OHLC columns: {missing}")
-
-    min_rows = max(cfg.ema_slow_len, cfg.slope_len) + 5
-    if len(df) < min_rows:
-        raise ValueError(
-            f"Not enough rows for EMA warmup and slope calculation. "
-            f"Need at least {min_rows}, got {len(df)}."
-        )
-
-
-def build_bucket_labels(edges: Sequence[float]) -> list[str]:
-    labels: list[str] = []
-    for i in range(len(edges) - 1):
-        left = edges[i]
-        right = edges[i + 1]
-        if math.isinf(right):
-            labels.append(f"{left:.2f}%+")
-        else:
-            labels.append(f"{left:.2f}-{right:.2f}%")
-    return labels
-
-
-def _bucket_index_from_abs_dist(abs_dist: pd.Series, edges: Sequence[float]) -> pd.Series:
-    values = abs_dist.to_numpy(dtype=float)
-    out = np.zeros(len(values), dtype=int)
-
-    finite_edges = list(edges[:-1])
-    if len(finite_edges) < 10:
-        raise ValueError("bucket_edges_pct must include Pine-style edges plus infinity.")
-
-    for i, v in enumerate(values):
-        if np.isnan(v):
-            out[i] = 0
-        elif v < finite_edges[1]:
-            out[i] = 1
-        elif v < finite_edges[2]:
-            out[i] = 2
-        elif v < finite_edges[3]:
-            out[i] = 3
-        elif v < finite_edges[4]:
-            out[i] = 4
-        elif v < finite_edges[5]:
-            out[i] = 5
-        elif v < finite_edges[6]:
-            out[i] = 6
-        elif v < finite_edges[7]:
-            out[i] = 7
-        elif v < finite_edges[8]:
-            out[i] = 8
-        elif v < finite_edges[9]:
-            out[i] = 9
-        else:
-            out[i] = 10
-
-    return pd.Series(out, index=abs_dist.index, dtype=int)
-
-
-def _bucket_text_from_index(bucket_index: pd.Series, edges: Sequence[float]) -> pd.Series:
-    labels = build_bucket_labels(edges)
-    mapping: Dict[int, str] = {
-        0: "NA",
-        1: labels[0],
-        2: labels[1],
-        3: labels[2],
-        4: labels[3],
-        5: labels[4],
-        6: labels[5],
-        7: labels[6],
-        8: labels[7],
-        9: labels[8],
-        10: labels[9],
-    }
-    return bucket_index.map(mapping).fillna("NA")
-
-
-def _stage_from_abs_dist(abs_dist: pd.Series, cfg: EmaDistanceConfig) -> pd.Series:
-    values = abs_dist.to_numpy(dtype=float)
-    out = np.zeros(len(values), dtype=int)
-
-    for i, v in enumerate(values):
-        if np.isnan(v):
-            out[i] = 0
-        elif v < cfg.zone1_max_pct:
-            out[i] = 1
-        elif v < cfg.zone2_max_pct:
-            out[i] = 2
-        elif v >= cfg.zone3_min_pct:
-            out[i] = 3
-        else:
-            out[i] = 0
-
-    return pd.Series(out, index=abs_dist.index, dtype=int)
-
-
-def _stage_text(stage: pd.Series) -> pd.Series:
-    mapping = {
-        0: "NONE",
-        1: "ZONE 1",
-        2: "ZONE 2",
-        3: "ZONE 3",
-    }
-    return stage.map(mapping).fillna("NONE")
-
-
-def _direction_text(v: int) -> str:
-    if v == 1:
-        return "BULL"
-    if v == -1:
-        return "BEAR"
-    return "NEUTRAL"
-
-
-def _safe_float(value: Any) -> Optional[float]:
-    if pd.isna(value):
-        return None
-    return float(value)
+def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
-    if pd.isna(value):
+    try:
+        if pd.isna(value):
+            return default
+        return int(value)
+    except Exception:
         return default
-    return int(value)
 
 
-def _safe_bool(value: Any) -> bool:
-    if pd.isna(value):
-        return False
-    return bool(value)
+def _safe_str(value: Any, default: str = "") -> str:
+    try:
+        if pd.isna(value):
+            return default
+        return str(value)
+    except Exception:
+        return default
 
 
-def _extract_last_timestamp(
-    features: pd.DataFrame,
-    cfg: EmaDistanceConfig,
-) -> Optional[str]:
-    if cfg.time_col and cfg.time_col in features.columns:
-        value = features.iloc[-1][cfg.time_col]
-        if pd.notna(value):
-            ts = pd.to_datetime(value, errors="coerce")
+def _safe_timestamp_from_df(df: pd.DataFrame, cfg: EmaDistanceConfig) -> Optional[str]:
+    if df is None or len(df) == 0:
+        return None
+
+    try:
+        if cfg.time_col and cfg.time_col in df.columns:
+            ts = pd.to_datetime(df.iloc[-1][cfg.time_col], errors="coerce")
             if pd.notna(ts):
                 return ts.isoformat()
-            return str(value)
 
-    if isinstance(features.index, pd.DatetimeIndex) and len(features.index) > 0:
-        ts = features.index[-1]
-        if pd.notna(ts):
-            return ts.isoformat()
+        if isinstance(df.index, pd.DatetimeIndex) and len(df.index) > 0:
+            ts = df.index[-1]
+            if pd.notna(ts):
+                return pd.Timestamp(ts).isoformat()
+    except Exception:
+        return None
 
     return None
 
 
-# =============================================================================
-# EMA CORE (PINE PARITY)
-# =============================================================================
-
-def build_ema_core(df: pd.DataFrame, cfg: EmaDistanceConfig) -> pd.DataFrame:
-    validate_ohlc(df, cfg)
+def _normalize_ohlc(
+    df: Optional[pd.DataFrame],
+    cfg: EmaDistanceConfig,
+) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame):
+        return pd.DataFrame(columns=[cfg.open_col, cfg.high_col, cfg.low_col, cfg.close_col])
 
     out = df.copy()
-    close = out[cfg.close_col].astype(float)
 
-    out["ema20"] = ema(close, cfg.ema_fast_len)
-    out["ema200"] = ema(close, cfg.ema_slow_len)
+    for col in [cfg.open_col, cfg.high_col, cfg.low_col, cfg.close_col]:
+        if col not in out.columns:
+            out[col] = np.nan
+        out[col] = pd.to_numeric(out[col], errors="coerce")
 
-    out["ema20_slope_pct"] = pct_change_from_past(out["ema20"], cfg.slope_len)
-    out["ema200_slope_pct"] = pct_change_from_past(out["ema200"], cfg.slope_len)
+    if cfg.time_col and cfg.time_col in out.columns:
+        try:
+            out[cfg.time_col] = pd.to_datetime(out[cfg.time_col], errors="coerce")
+        except Exception:
+            pass
+
+    return out
+
+
+def _ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False, min_periods=1).mean()
+
+
+def _pct_change_from_past(series: pd.Series, lookback: int) -> pd.Series:
+    prev = series.shift(lookback)
+    result = np.where(
+        prev.notna() & (prev != 0.0),
+        ((series - prev) / prev) * 100.0,
+        np.nan,
+    )
+    return pd.Series(result, index=series.index, dtype=float)
+
+
+def _default_payload(
+    cfg: EmaDistanceConfig,
+    timestamp: Optional[str] = None,
+    message: str = "EMA Distance fallback payload.",
+) -> Dict[str, Any]:
+    return {
+        "module": cfg.module_name,
+        "debug_version": cfg.debug_version,
+        "ready": False,
+        "timestamp": timestamp,
+        "state": "Transition",
+        "bias_signal": 0,
+        "bias_label": "NEUTRAL",
+        "indicator_strength": 0.0,
+        "market_bias": "NEUTRAL",
+        "stage": 0,
+        "stage_label": "Transition",
+        "distance_pct": None,
+        "distance_signed_pct": None,
+        "ema20": None,
+        "ema200": None,
+        "ema20_slope_pct": None,
+        "ema200_slope_pct": None,
+        "trend_side": 0,
+        "price_side_vs_ema20": 0,
+        "bars_in_state": 0,
+        "message": message,
+    }
+
+
+# =============================================================================
+# ENGINE
+# =============================================================================
+
+def build_ema_distance_engine(
+    df: pd.DataFrame,
+    cfg: Optional[EmaDistanceConfig] = None,
+) -> pd.DataFrame:
+    cfg = cfg or EmaDistanceConfig()
+    out = _normalize_ohlc(df, cfg)
+
+    if out.empty:
+        out["ema20"] = _empty_series(out.index)
+        out["ema200"] = _empty_series(out.index)
+        out["ema20_slope_pct"] = _empty_series(out.index)
+        out["ema200_slope_pct"] = _empty_series(out.index)
+        out["trend_side"] = _empty_series(out.index, dtype="int64")
+        out["price_side_vs_ema20"] = _empty_series(out.index, dtype="int64")
+        out["distance_signed"] = _empty_series(out.index)
+        out["distance_signed_pct"] = _empty_series(out.index)
+        out["distance_pct"] = _empty_series(out.index)
+        return out
+
+    close = out[cfg.close_col]
+
+    out["ema20"] = _ema(close, cfg.ema_fast_len)
+    out["ema200"] = _ema(close, cfg.ema_slow_len)
+    out["ema20_slope_pct"] = _pct_change_from_past(out["ema20"], cfg.slope_len)
+    out["ema200_slope_pct"] = _pct_change_from_past(out["ema200"], cfg.slope_len)
 
     out["trend_side"] = np.where(
         out["ema20"] > out["ema200"],
         1,
         np.where(out["ema20"] < out["ema200"], -1, 0),
-    )
+    ).astype(int)
 
     out["price_side_vs_ema20"] = np.where(
-        out[cfg.close_col] > out["ema20"],
+        close > out["ema20"],
         1,
-        np.where(out[cfg.close_col] < out["ema20"], -1, 0),
-    )
+        np.where(close < out["ema20"], -1, 0),
+    ).astype(int)
 
-    return out
-
-
-# =============================================================================
-# DISTANCE ENGINE (PINE PARITY)
-# =============================================================================
-
-def build_distance_engine(features: pd.DataFrame, cfg: EmaDistanceConfig) -> pd.DataFrame:
-    out = features.copy()
-
-    out["e20_to_e200_signed"] = out["ema20"] - out["ema200"]
-    out["e20_to_e200_pct"] = np.where(
-        out["ema200"] != 0.0,
+    out["distance_signed"] = out["ema20"] - out["ema200"]
+    out["distance_signed_pct"] = np.where(
+        out["ema200"].notna() & (out["ema200"] != 0.0),
         ((out["ema20"] - out["ema200"]) / out["ema200"]) * 100.0,
         np.nan,
     )
-    out["abs_e20_to_e200_pct"] = out["e20_to_e200_pct"].abs()
+    out["distance_pct"] = out["distance_signed_pct"].abs()
 
     return out
 
 
 # =============================================================================
-# SIGNAL FILTER ENGINE (PINE PARITY)
+# STATE
 # =============================================================================
 
-def build_signal_engine(features: pd.DataFrame, cfg: EmaDistanceConfig) -> pd.DataFrame:
+def build_ema_distance_state(
+    features: pd.DataFrame,
+    cfg: Optional[EmaDistanceConfig] = None,
+) -> pd.DataFrame:
+    cfg = cfg or EmaDistanceConfig()
     out = features.copy()
 
-    base_signal = (
-        (out["trend_side"] != 0)
-        & out["abs_e20_to_e200_pct"].notna()
-        & (out["abs_e20_to_e200_pct"] >= cfg.min_abs_distance_pct)
+    if out.empty:
+        out["stage"] = _empty_series(out.index, dtype="int64")
+        out["stage_label"] = _empty_series(out.index, dtype="object")
+        out["state"] = _empty_series(out.index, dtype="object")
+        out["bias_signal"] = _empty_series(out.index, dtype="int64")
+        out["bias_label"] = _empty_series(out.index, dtype="object")
+        out["indicator_strength"] = _empty_series(out.index)
+        out["market_bias"] = _empty_series(out.index, dtype="object")
+        return out
+
+    dist = pd.to_numeric(out["distance_pct"], errors="coerce").fillna(0.0)
+
+    stage = np.select(
+        [
+            dist < cfg.stage0_max_pct,
+            (dist >= cfg.stage0_max_pct) & (dist < cfg.stage1_max_pct),
+            (dist >= cfg.stage1_max_pct) & (dist < cfg.stage2_max_pct),
+            dist >= cfg.stage2_max_pct,
+        ],
+        [0, 1, 2, 3],
+        default=0,
     )
 
-    if cfg.require_price_on_trend_side:
-        price_filter = out["price_side_vs_ema20"] == out["trend_side"]
-    else:
-        price_filter = pd.Series(True, index=out.index)
+    out["stage"] = pd.Series(stage, index=out.index, dtype=int)
 
-    if cfg.require_fast_slope_confirm:
-        fast_slope_filter = np.where(
-            out["trend_side"] == 1,
-            out["ema20_slope_pct"] > 0,
-            out["ema20_slope_pct"] < 0,
+    stage_map = {
+        0: "Transition",
+        1: "Optimal Trend",
+        2: "Extended Trend",
+        3: "Exhaustion",
+    }
+    out["stage_label"] = out["stage"].map(stage_map).fillna("Transition")
+    out["state"] = out["stage_label"]
+
+    bias_ok = (
+        out["trend_side"].notna()
+        & out["price_side_vs_ema20"].notna()
+        & (
+            (out["trend_side"] == out["price_side_vs_ema20"])
+            | (out["price_side_vs_ema20"] == 0)
         )
-        fast_slope_filter = pd.Series(fast_slope_filter, index=out.index)
-    else:
-        fast_slope_filter = pd.Series(True, index=out.index)
-
-    if cfg.require_slow_slope_confirm:
-        slow_slope_filter = np.where(
-            out["trend_side"] == 1,
-            out["ema200_slope_pct"] >= 0,
-            out["ema200_slope_pct"] <= 0,
-        )
-        slow_slope_filter = pd.Series(slow_slope_filter, index=out.index)
-    else:
-        slow_slope_filter = pd.Series(True, index=out.index)
-
-    out["base_signal"] = base_signal.fillna(False)
-    out["price_filter"] = price_filter.fillna(False)
-    out["fast_slope_filter"] = fast_slope_filter.fillna(False)
-    out["slow_slope_filter"] = slow_slope_filter.fillna(False)
-
-    out["research_signal"] = (
-        out["base_signal"]
-        & out["price_filter"]
-        & out["fast_slope_filter"]
-        & out["slow_slope_filter"]
-        & out["ema20"].notna()
-        & out["ema200"].notna()
-    ).fillna(False)
-
-    return out
-
-
-# =============================================================================
-# BUCKET ENGINE (PINE PARITY)
-# =============================================================================
-
-def build_bucket_engine(features: pd.DataFrame, cfg: EmaDistanceConfig) -> pd.DataFrame:
-    out = features.copy()
-
-    out["bucket_index"] = _bucket_index_from_abs_dist(
-        out["abs_e20_to_e200_pct"],
-        cfg.bucket_edges_pct,
-    )
-    out["bucket_text"] = _bucket_text_from_index(
-        out["bucket_index"],
-        cfg.bucket_edges_pct,
     )
 
+    out["bias_signal"] = np.where(
+        bias_ok,
+        out["trend_side"].fillna(0).astype(int),
+        0,
+    ).astype(int)
+
+    bias_map = {
+        1: "BULLISH",
+        0: "NEUTRAL",
+        -1: "BEARISH",
+    }
+    out["bias_label"] = out["bias_signal"].map(bias_map).fillna("NEUTRAL")
+    out["market_bias"] = out["bias_label"]
+
+    strength = np.select(
+        [
+            out["stage"] == 0,
+            out["stage"] == 1,
+            out["stage"] == 2,
+            out["stage"] == 3,
+        ],
+        [25.0, 70.0, 85.0, 60.0],
+        default=0.0,
+    )
+
+    out["indicator_strength"] = np.where(
+        out["bias_signal"] == 0,
+        np.minimum(strength, 35.0),
+        strength,
+    ).astype(float)
+
     return out
 
 
 # =============================================================================
-# STAGE ENGINE (PINE PARITY)
+# MEMORY
 # =============================================================================
 
-def build_stage_engine(features: pd.DataFrame, cfg: EmaDistanceConfig) -> pd.DataFrame:
+def build_ema_distance_memory(
+    features: pd.DataFrame,
+    cfg: Optional[EmaDistanceConfig] = None,
+) -> pd.DataFrame:
+    _ = cfg or EmaDistanceConfig()
     out = features.copy()
 
-    out["stage"] = _stage_from_abs_dist(out["abs_e20_to_e200_pct"], cfg)
-    out["stage_text"] = _stage_text(out["stage"])
-    out["trend_text"] = out["trend_side"].map(_direction_text)
+    if out.empty or "stage" not in out.columns:
+        out["bars_in_state"] = _empty_series(out.index, dtype="int64")
+        return out
+
+    groups = (out["stage"] != out["stage"].shift(1)).cumsum()
+    out["bars_in_state"] = out.groupby(groups).cumcount() + 1
+    out["bars_in_state"] = out["bars_in_state"].fillna(0).astype(int)
 
     return out
 
 
 # =============================================================================
-# FEATURE FRAME
+# EXPORT
 # =============================================================================
 
 def build_feature_frame(
@@ -390,17 +340,15 @@ def build_feature_frame(
 ) -> pd.DataFrame:
     cfg = cfg or EmaDistanceConfig()
 
-    out = build_ema_core(df, cfg)
-    out = build_distance_engine(out, cfg)
-    out = build_signal_engine(out, cfg)
-    out = build_bucket_engine(out, cfg)
-    out = build_stage_engine(out, cfg)
+    out = build_ema_distance_engine(df, cfg)
+    out = build_ema_distance_state(out, cfg)
+    out = build_ema_distance_memory(out, cfg)
 
     return out
 
 
 # =============================================================================
-# WEBSITE PAYLOAD
+# PAYLOAD
 # =============================================================================
 
 def build_latest_payload(
@@ -408,42 +356,60 @@ def build_latest_payload(
     cfg: Optional[EmaDistanceConfig] = None,
 ) -> Dict[str, Any]:
     cfg = cfg or EmaDistanceConfig()
-    features = build_feature_frame(df, cfg)
+    timestamp = _safe_timestamp_from_df(df if isinstance(df, pd.DataFrame) else None, cfg)
 
-    if features.empty:
-        return {
+    try:
+        features = build_feature_frame(df, cfg)
+
+        if features.empty:
+            return _default_payload(
+                cfg=cfg,
+                timestamp=timestamp,
+                message="EMA Distance received empty dataframe.",
+            )
+
+        last = features.iloc[-1]
+
+        payload: Dict[str, Any] = {
             "module": cfg.module_name,
             "debug_version": cfg.debug_version,
-            "ready": False,
-            "message": "No data available.",
+            "ready": True,
+            "timestamp": timestamp,
+            "state": _safe_str(last.get("state"), "Transition"),
+            "bias_signal": _safe_int(last.get("bias_signal"), 0),
+            "bias_label": _safe_str(last.get("bias_label"), "NEUTRAL"),
+            "indicator_strength": float(
+                max(0.0, min(100.0, _safe_float(last.get("indicator_strength"), 0.0) or 0.0))
+            ),
+            "market_bias": _safe_str(last.get("market_bias"), "NEUTRAL"),
+            "stage": _safe_int(last.get("stage"), 0),
+            "stage_label": _safe_str(last.get("stage_label"), "Transition"),
+            "distance_pct": _safe_float(last.get("distance_pct")),
+            "distance_signed_pct": _safe_float(last.get("distance_signed_pct")),
+            "ema20": _safe_float(last.get("ema20")),
+            "ema200": _safe_float(last.get("ema200")),
+            "ema20_slope_pct": _safe_float(last.get("ema20_slope_pct")),
+            "ema200_slope_pct": _safe_float(last.get("ema200_slope_pct")),
+            "trend_side": _safe_int(last.get("trend_side"), 0),
+            "price_side_vs_ema20": _safe_int(last.get("price_side_vs_ema20"), 0),
+            "bars_in_state": _safe_int(last.get("bars_in_state"), 0),
         }
 
-    last = features.iloc[-1]
-    timestamp = _extract_last_timestamp(features, cfg)
+        return payload
 
-    payload: Dict[str, Any] = {
-        "module": cfg.module_name,
-        "debug_version": cfg.debug_version,
-        "ready": True,
-        "timestamp": timestamp,
-        "trend_side": _safe_int(last["trend_side"]),
-        "trend_text": str(last["trend_text"]),
-        "price_side_vs_ema20": _safe_int(last["price_side_vs_ema20"]),
-        "ema20": _safe_float(last["ema20"]),
-        "ema200": _safe_float(last["ema200"]),
-        "ema20_slope_pct": _safe_float(last["ema20_slope_pct"]),
-        "ema200_slope_pct": _safe_float(last["ema200_slope_pct"]),
-        "e20_to_e200_signed": _safe_float(last["e20_to_e200_signed"]),
-        "e20_to_e200_pct": _safe_float(last["e20_to_e200_pct"]),
-        "abs_e20_to_e200_pct": _safe_float(last["abs_e20_to_e200_pct"]),
-        "bucket_index": _safe_int(last["bucket_index"]),
-        "bucket_text": str(last["bucket_text"]),
-        "stage": _safe_int(last["stage"]),
-        "stage_text": str(last["stage_text"]),
-        "research_signal": _safe_bool(last["research_signal"]),
-    }
+    except Exception as exc:
+        return _default_payload(
+            cfg=cfg,
+            timestamp=timestamp,
+            message=f"EMA Distance fallback triggered: {exc}",
+        )
 
-    return payload
+
+def build_ema_distance_latest_payload(
+    df: pd.DataFrame,
+    cfg: Optional[EmaDistanceConfig] = None,
+) -> Dict[str, Any]:
+    return build_latest_payload(df, cfg)
 
 
 def build_live_result(

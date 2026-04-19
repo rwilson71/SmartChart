@@ -953,11 +953,6 @@ def r_confluence(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> p
 
     return out
 
-
-# =============================================================================
-# PAYLOAD BUILDER
-# =============================================================================
-
 def build_confluence_latest_payload(
     df: pd.DataFrame,
     config: Optional[Dict[str, Any]] = None,
@@ -977,15 +972,192 @@ def build_confluence_latest_payload(
     density_dir = _safe_int(row.get("sc_confl_density_dir")) or 0
     imb_dir = _safe_int(row.get("sc_confl_imb_dir")) or 0
     ic_strength = _safe_int(row.get("sc_confl_strength")) or 0
+    ic_score = _safe_int(row.get("sc_confl_score")) or 0
+    ic_ttl = _safe_int(row.get("sc_confl_ttl")) or 0
+
+    macro_ready = _safe_bool(row.get("sc_confl_macro_ready"))
+    in_macro = _safe_bool(row.get("sc_confl_in_macro"))
+    core_ready = _safe_bool(row.get("sc_confl_core_ready"))
+    in_core = _safe_bool(row.get("sc_confl_in_core"))
+    density_event = _safe_bool(row.get("sc_confl_density_event"))
+    imbalance_live = _safe_bool(row.get("sc_confl_imb_live"))
+    vp_inside_va = _safe_bool(row.get("sc_confl_vp_inside_va"))
+    vp_agrees = _safe_bool(row.get("sc_confl_vp_agree"))
+    momentum_ok = _safe_bool(row.get("sc_confl_momentum_ok"))
+    trigger_ok = _safe_bool(row.get("sc_confl_trigger_ok"))
+    ready = _safe_bool(row.get("sc_confl_ready"))
+    valid = _safe_bool(row.get("sc_confl_valid"))
+    active = _safe_bool(row.get("sc_confl_active"))
+
+    mtf_avg = _safe_float(row.get("sc_confl_mtf_avg"))
+    delta_norm = _safe_float(row.get("sc_confl_delta_norm"))
+    quality = _safe_float(row.get("sc_confl_quality"))
+
+    # -------------------------------------------------------------------------
+    # ULTIMATE TRUTH DASHBOARD CONTRACT
+    # -------------------------------------------------------------------------
+    bias_signal = direction
+
+    if bias_signal > 0:
+        bias_label = "BULLISH"
+    elif bias_signal < 0:
+        bias_label = "BEARISH"
+    else:
+        bias_label = "NEUTRAL"
+
+    # Market bias can stay aligned to confluence direction.
+    # Fallback to MTF direction if confluence direction is neutral.
+    if direction > 0:
+        market_bias = "BULLISH"
+    elif direction < 0:
+        market_bias = "BEARISH"
+    elif mtf_dir > 0:
+        market_bias = "BULLISH"
+    elif mtf_dir < 0:
+        market_bias = "BEARISH"
+    else:
+        market_bias = "NEUTRAL"
+
+    # Website / truth-table state hierarchy
+    if direction == 1 and active:
+        state = "BULLISH_ACTIVE"
+    elif direction == -1 and active:
+        state = "BEARISH_ACTIVE"
+    elif direction == 1 and valid:
+        state = "BULLISH_VALID"
+    elif direction == -1 and valid:
+        state = "BEARISH_VALID"
+    elif direction == 1 and ready:
+        state = "BULLISH_READY"
+    elif direction == -1 and ready:
+        state = "BEARISH_READY"
+    elif direction == 1 and macro_ready and core_ready:
+        state = "BULLISH_BUILDING"
+    elif direction == -1 and macro_ready and core_ready:
+        state = "BEARISH_BUILDING"
+    elif direction == 1:
+        state = "BULLISH"
+    elif direction == -1:
+        state = "BEARISH"
+    else:
+        state = "NEUTRAL"
+
+    # Normalize strength to shared dashboard scale
+    # Primary mapping from ic_strength, with a small uplift if score/quality are strong
+    base_strength_map = {
+        0: 0.0,
+        1: 40.0,
+        2: 70.0,
+        3: 100.0,
+    }
+    indicator_strength = base_strength_map.get(ic_strength, 0.0)
+
+    if quality is not None:
+        indicator_strength = max(indicator_strength, round(float(quality) * 100.0, 2))
+
+    if ic_score >= 5:
+        indicator_strength = max(indicator_strength, 100.0)
+    elif ic_score == 4:
+        indicator_strength = max(indicator_strength, 75.0)
+    elif ic_score == 3:
+        indicator_strength = max(indicator_strength, 55.0)
+
+    indicator_strength = round(min(100.0, max(0.0, indicator_strength)), 2)
+
+    # Useful top-level text helpers for website cards
+    if active:
+        status_label = "ACTIVE"
+    elif valid:
+        status_label = "VALID"
+    elif ready:
+        status_label = "READY"
+    else:
+        status_label = "IDLE"
+
+    summary = (
+        f"{bias_label} confluence / "
+        f"{status_label} / "
+        f"strength {_strength_label(ic_strength)} / "
+        f"score {ic_score}"
+    )
 
     payload: Dict[str, Any] = {
         "indicator": "confluence",
         "name": "SmartChart Confluence Engine",
-        "version": "confluence_payload_v1",
-
+        "debug_version": "confluence_payload_v2",
         "timestamp": str(result.index[-1]),
 
-        "state": {
+        # ---------------------------------------------------------------------
+        # SHARED ULTIMATE TRUTH DASHBOARD CONTRACT
+        # ---------------------------------------------------------------------
+        "state": state,
+        "bias_signal": bias_signal,
+        "bias_label": bias_label,
+        "indicator_strength": indicator_strength,
+        "market_bias": market_bias,
+
+        # Helpful shared extras
+        "status_label": status_label,
+        "summary": summary,
+
+        # Flat website-facing fields
+        "direction": direction,
+        "direction_label": _dir_label(direction),
+        "mtf_dir": mtf_dir,
+        "mtf_dir_label": _dir_label(mtf_dir),
+        "macro_dir": macro_dir,
+        "macro_dir_label": _dir_label(macro_dir),
+        "vp_bias": vp_bias,
+        "vp_bias_label": _dir_label(vp_bias),
+        "vp_dir": vp_dir,
+        "vp_dir_label": _dir_label(vp_dir),
+        "liq_dir": liq_dir,
+        "liq_dir_label": _dir_label(liq_dir),
+        "density_dir": density_dir,
+        "density_dir_label": _dir_label(density_dir),
+        "imbalance_dir": imb_dir,
+        "imbalance_dir_label": _dir_label(imb_dir),
+
+        "mtf_avg": mtf_avg,
+        "delta_norm": delta_norm,
+        "score": ic_score,
+        "strength": ic_strength,
+        "strength_label": _strength_label(ic_strength),
+        "quality": quality,
+
+        "macro_ready": macro_ready,
+        "in_macro": in_macro,
+        "core_ready": core_ready,
+        "in_core": in_core,
+        "density_event": density_event,
+        "imbalance_live": imbalance_live,
+        "vp_inside_va": vp_inside_va,
+        "vp_agrees_with_confluence": vp_agrees,
+        "momentum_ok": momentum_ok,
+        "trigger_ok": trigger_ok,
+        "ready": ready,
+        "valid": valid,
+        "active": active,
+        "ttl": ic_ttl,
+
+        "macro_zone_lo": _safe_float(row.get("sc_confl_macro_lo")),
+        "macro_zone_hi": _safe_float(row.get("sc_confl_macro_hi")),
+        "core_zone_lo": _safe_float(row.get("sc_confl_core_lo")),
+        "core_zone_hi": _safe_float(row.get("sc_confl_core_hi")),
+
+        "vp_val": _safe_float(row.get("sc_confl_vp_val")),
+        "vp_poc": _safe_float(row.get("sc_confl_vp_poc")),
+        "vp_vah": _safe_float(row.get("sc_confl_vp_vah")),
+        "vp_dist_to_poc_pct": _safe_float(row.get("sc_confl_vp_dist_to_poc_pct")),
+
+        "close": _safe_float(row.get("close")),
+        "high": _safe_float(row.get("high")),
+        "low": _safe_float(row.get("low")),
+
+        # ---------------------------------------------------------------------
+        # KEEP NESTED BACKEND STRUCTURE TOO
+        # ---------------------------------------------------------------------
+        "state_detail": {
             "direction": direction,
             "direction_label": _dir_label(direction),
             "mtf_dir": mtf_dir,
@@ -1005,29 +1177,29 @@ def build_confluence_latest_payload(
         },
 
         "scores": {
-            "mtf_avg": _safe_float(row.get("sc_confl_mtf_avg")),
-            "delta_norm": _safe_float(row.get("sc_confl_delta_norm")),
-            "score": _safe_int(row.get("sc_confl_score")),
+            "mtf_avg": mtf_avg,
+            "delta_norm": delta_norm,
+            "score": ic_score,
             "strength": ic_strength,
             "strength_label": _strength_label(ic_strength),
-            "quality": _safe_float(row.get("sc_confl_quality")),
+            "quality": quality,
         },
 
         "status": {
-            "macro_ready": _safe_bool(row.get("sc_confl_macro_ready")),
-            "in_macro": _safe_bool(row.get("sc_confl_in_macro")),
-            "core_ready": _safe_bool(row.get("sc_confl_core_ready")),
-            "in_core": _safe_bool(row.get("sc_confl_in_core")),
-            "density_event": _safe_bool(row.get("sc_confl_density_event")),
-            "imbalance_live": _safe_bool(row.get("sc_confl_imb_live")),
-            "vp_inside_va": _safe_bool(row.get("sc_confl_vp_inside_va")),
-            "vp_agrees_with_confluence": _safe_bool(row.get("sc_confl_vp_agree")),
-            "momentum_ok": _safe_bool(row.get("sc_confl_momentum_ok")),
-            "trigger_ok": _safe_bool(row.get("sc_confl_trigger_ok")),
-            "ready": _safe_bool(row.get("sc_confl_ready")),
-            "valid": _safe_bool(row.get("sc_confl_valid")),
-            "active": _safe_bool(row.get("sc_confl_active")),
-            "ttl": _safe_int(row.get("sc_confl_ttl")) or 0,
+            "macro_ready": macro_ready,
+            "in_macro": in_macro,
+            "core_ready": core_ready,
+            "in_core": in_core,
+            "density_event": density_event,
+            "imbalance_live": imbalance_live,
+            "vp_inside_va": vp_inside_va,
+            "vp_agrees_with_confluence": vp_agrees,
+            "momentum_ok": momentum_ok,
+            "trigger_ok": trigger_ok,
+            "ready": ready,
+            "valid": valid,
+            "active": active,
+            "ttl": ic_ttl,
         },
 
         "zones": {

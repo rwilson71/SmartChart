@@ -133,12 +133,50 @@ def regime_text(v: int) -> str:
     return "NONE"
 
 
+def derive_bias_signal(regime: int) -> int:
+    if regime == 3:
+        return 1
+    if regime == 1:
+        return -1
+    return 0
+
+
+def derive_bias_label(signal: int) -> str:
+    if signal > 0:
+        return "BULLISH"
+    if signal < 0:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def derive_market_bias(signal: int) -> str:
+    if signal > 0:
+        return "BULLISH"
+    if signal < 0:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def derive_indicator_strength(vol_score: float) -> float:
+    strength = abs(float(vol_score)) * 100.0
+    return float(np.clip(strength, 0.0, 100.0))
+
+
 # ==============================================================================
 # OUTPUT CONTRACT
 # ==============================================================================
 
 @dataclass
 class VolatilityOutput:
+    # Standard website contract
+    timestamp: Any
+    state: str
+    bias_signal: int
+    bias_label: str
+    indicator_strength: float
+    market_bias: str
+
+    # Core volatility outputs
     sc_vol_regime: int
     sc_vol_regime_text: str
     sc_vol_score: float
@@ -166,8 +204,6 @@ class VolatilityOutput:
     vp_on: bool
     vol_on: bool
     mtf_on: bool
-
-    timestamp: Any
 
 
 # ==============================================================================
@@ -308,14 +344,15 @@ class VolatilityEngine:
             best_vol = np.nan
             best_price = np.nan
 
-            # Pine logic:
-            # for each bin, scan every bar in lookback and accumulate bucket volume
             for b in range(c.vp_bins):
                 lo_bin = ll + b * bin_size
                 hi_bin = lo_bin + bin_size
                 bucket_vol = 0.0
 
-                for px, vv in zip(window_hlc3.to_numpy(dtype=float), window["volume"].to_numpy(dtype=float)):
+                for px, vv in zip(
+                    window_hlc3.to_numpy(dtype=float),
+                    window["volume"].to_numpy(dtype=float),
+                ):
                     if b == c.vp_bins - 1:
                         in_bin = (px >= lo_bin) and (px <= hi_bin)
                     else:
@@ -421,6 +458,15 @@ class VolatilityEngine:
         out["sc_va_hi"] = out["va_hi"]
         out["sc_va_lo"] = out["va_lo"]
 
+        # ------------------------------------------------------------------
+        # Standard website contract
+        # ------------------------------------------------------------------
+        out["state"] = out["sc_vol_regime_text"]
+        out["bias_signal"] = out["sc_vol_regime"].apply(derive_bias_signal)
+        out["bias_label"] = out["bias_signal"].apply(derive_bias_label)
+        out["market_bias"] = out["bias_signal"].apply(derive_market_bias)
+        out["indicator_strength"] = out["sc_vol_score"].apply(derive_indicator_strength)
+
         return out
 
     def _vol_state_score_series(self, df: pd.DataFrame) -> pd.Series:
@@ -437,10 +483,16 @@ class VolatilityEngine:
         if c.vol_use_band_filter:
             ema_fast_s = ema(df["close"], c.ema_fast_len)
             ema_slow_s = ema(df["close"], c.ema_slow_len)
-            band_spread_pct = safe_pct_diff(ema_fast_s, ema_slow_s, df["close"]).abs()
+            band_spread_pct = safe_pct_diff(
+                ema_fast_s, ema_slow_s, df["close"]
+            ).abs()
 
-            band_cmp_ok = band_spread_pct.notna() & (band_spread_pct <= c.vol_band_cmp_max_pct)
-            band_exp_ok = band_spread_pct.notna() & (band_spread_pct >= c.vol_band_exp_min_pct)
+            band_cmp_ok = band_spread_pct.notna() & (
+                band_spread_pct <= c.vol_band_cmp_max_pct
+            )
+            band_exp_ok = band_spread_pct.notna() & (
+                band_spread_pct >= c.vol_band_exp_min_pct
+            )
 
             raw_cmp = raw_cmp & band_cmp_ok
             raw_exp = raw_exp & band_exp_ok
@@ -467,10 +519,27 @@ class VolatilityEngine:
         calc = self.calculate(df)
         row = calc.iloc[-1]
 
+        sc_vol_regime = int(row["sc_vol_regime"])
+        sc_vol_regime_text = str(row["sc_vol_regime_text"])
+        sc_vol_score = float(row["sc_vol_score"])
+
+        bias_signal = int(row["bias_signal"])
+        bias_label = str(row["bias_label"])
+        market_bias = str(row["market_bias"])
+        indicator_strength = float(row["indicator_strength"])
+        state = str(row["state"])
+
         return VolatilityOutput(
-            sc_vol_regime=int(row["sc_vol_regime"]),
-            sc_vol_regime_text=str(row["sc_vol_regime_text"]),
-            sc_vol_score=float(row["sc_vol_score"]),
+            timestamp=calc.index[-1],
+            state=state,
+            bias_signal=bias_signal,
+            bias_label=bias_label,
+            indicator_strength=indicator_strength,
+            market_bias=market_bias,
+
+            sc_vol_regime=sc_vol_regime,
+            sc_vol_regime_text=sc_vol_regime_text,
+            sc_vol_score=sc_vol_score,
             sc_vol_compression=bool(row["sc_vol_compression"]),
             sc_vol_normal=bool(row["sc_vol_normal"]),
             sc_vol_expansion=bool(row["sc_vol_expansion"]),
@@ -495,8 +564,6 @@ class VolatilityEngine:
             vp_on=bool(self.config.vp_on),
             vol_on=bool(self.config.vol_on),
             mtf_on=bool(self.config.mtf_on),
-
-            timestamp=calc.index[-1],
         )
 
 

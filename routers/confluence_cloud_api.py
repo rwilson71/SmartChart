@@ -13,7 +13,6 @@ CACHE_PATH = Path("data/cache/confluence_cloud_latest.json")
 
 @router.get("/website/confluence-cloud/latest")
 def get_confluence_cloud_latest():
-    # Cache first
     if CACHE_PATH.exists():
         try:
             with CACHE_PATH.open("r", encoding="utf-8") as f:
@@ -24,7 +23,6 @@ def get_confluence_cloud_latest():
                 detail=f"Failed to read Confluence Cloud cache: {e}",
             )
 
-    # Live fallback
     try:
         df = load_price_data()
 

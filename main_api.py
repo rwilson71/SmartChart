@@ -35,6 +35,8 @@ from routers.pullback_retest_api import router as pullback_retest_router
 from routers.regime_api import router as regime_router
 from routers.fvg_api import router as fvg_router
 from routers.volume_api import router as volume_router
+from routers.x_1h_4h_first_candle_api import router as htf_first_candle_router
+from routers.w_5m_15m_first_candle_api import router as ltf_first_candle_router
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -99,6 +101,8 @@ app.include_router(pullback_retest_router)
 app.include_router(regime_router)
 app.include_router(fvg_router)
 app.include_router(volume_router)
+app.include_router(htf_first_candle_router)
+app.include_router(ltf_first_candle_router)
 # =============================================================================
 # HELPERS
 # =============================================================================

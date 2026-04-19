@@ -1264,11 +1264,6 @@ def run_volume_engine_full(
     engine = VolumeEngine(config=config)
     return engine.calculate(df)
 
-
-# =============================================================================
-# WEBSITE PAYLOAD BUILDER
-# =============================================================================
-
 def build_volume_latest_payload(
     df: pd.DataFrame,
     config: Optional[VolumeConfig] = None,
@@ -1284,17 +1279,40 @@ def build_volume_latest_payload(
     }.get(latest.vol_state, "NORMAL")
 
     vol_bias_label = {
-        1: "BULL",
-        -1: "BEAR",
+        1: "BULLISH",
+        -1: "BEARISH",
         0: "NEUTRAL",
     }.get(latest.vol_bias, "NEUTRAL")
+
+    # -------------------------------------------------------------------------
+    # Ultimate Truth website contract
+    # -------------------------------------------------------------------------
+    bias_signal = int(latest.orderflow_bias if latest.orderflow_bias != 0 else latest.vol_bias)
+
+    bias_label = {
+        1: "BULLISH",
+        -1: "BEARISH",
+        0: "NEUTRAL",
+    }.get(bias_signal, "NEUTRAL")
+
+    state = latest.orderflow_state if latest.orderflow_state else vol_state_label
+
+    indicator_strength = round(float(latest.signal_quality) * 100.0, 2)
+
+    market_bias = bias_label
 
     payload: Dict[str, Any] = {
         "indicator": "volume",
         "module": "m_volume",
-        "version": "volume_orderflow_payload_v1",
+        "version": "volume_orderflow_payload_v2",
 
+        # Shared website / Ultimate Truth contract
         "timestamp": str(latest.timestamp),
+        "state": state,
+        "bias_signal": bias_signal,
+        "bias_label": bias_label,
+        "indicator_strength": indicator_strength,
+        "market_bias": market_bias,
 
         "summary": {
             "state": vol_state_label,

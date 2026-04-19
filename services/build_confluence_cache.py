@@ -1,38 +1,42 @@
+from __future__ import annotations
+
 import json
 import time
 from pathlib import Path
-
-import pandas as pd
+from typing import Any, Dict
 
 from core.data_loader import load_price_data
 from core.r_confluence import build_confluence_latest_payload
+
 
 CACHE_PATH = Path("data/cache/confluence_latest.json")
 REFRESH_SECONDS = 10
 
 
-def run_confluence_build() -> None:
+def run_confluence_build() -> Dict[str, Any] | None:
     try:
         df = load_price_data().tail(5000).copy()
 
         if df.empty:
             print("Confluence build error: empty dataset")
-            return
+            return None
 
         payload = build_confluence_latest_payload(df)
 
         if not payload:
             print("Confluence build error: empty payload")
-            return
+            return None
 
         CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with CACHE_PATH.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+            json.dump(payload, f, indent=2, default=str)
 
         print(f"Confluence cache updated: {CACHE_PATH}")
+        return payload
 
     except Exception as e:
         print(f"Confluence build error: {e}")
+        return None
 
 
 if __name__ == "__main__":

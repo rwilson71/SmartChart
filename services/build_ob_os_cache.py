@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import json
 import time
 from pathlib import Path
+from typing import Any, Dict
 
 import pandas as pd
 
@@ -21,6 +24,7 @@ def load_ob_os_data() -> pd.DataFrame:
     """
     Standard loader path for cache service.
     Uses shared loader first to stay aligned with Trend / EMA pipeline.
+    Falls back to local CSV if needed.
     """
     try:
         df = load_price_data()
@@ -29,7 +33,6 @@ def load_ob_os_data() -> pd.DataFrame:
     except Exception:
         pass
 
-    # Fallback local CSV loader
     df = pd.read_csv(DATA_PATH)
 
     for col in ["datetime", "timestamp", "time", "date"]:
@@ -41,31 +44,40 @@ def load_ob_os_data() -> pd.DataFrame:
     return df
 
 
+def build_ob_os_cache() -> Dict[str, Any]:
+    df = load_ob_os_data()
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError("No valid price data returned for OB/OS cache build.")
+
+    payload = build_ob_os_latest_payload(df)
+
+    if not payload:
+        raise ValueError("OB/OS payload build returned empty payload.")
+
+    ensure_cache_dir()
+
+    with CACHE_PATH.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=str)
+
+    return payload
+
+
 def run_ob_os_build() -> None:
     try:
-        df = load_ob_os_data()
-
-        if df is None or df.empty:
-            print("OB/OS cache build error: empty dataset")
-            return
-
-        payload = build_ob_os_latest_payload(df)
-
-        if not payload:
-            print("OB/OS cache build error: empty payload")
-            return
-
-        ensure_cache_dir()
-        with CACHE_PATH.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-
+        payload = build_ob_os_cache()
         print(
-            f"OB/OS cache updated: "
-            f"{payload.get('timestamp', 'unknown')} | "
-            f"state={payload.get('state_text', 'NA')} | "
-            f"grade={payload.get('grade_text', 'NA')}"
+            "OB/OS cache updated:",
+            payload.get("timestamp", "unknown"),
+            "| state=",
+            payload.get("state", "NA"),
+            "| bias_signal=",
+            payload.get("bias_signal", "NA"),
+            "| bias_label=",
+            payload.get("bias_label", "NA"),
+            "| grade=",
+            payload.get("grade_text", "NA"),
         )
-
     except Exception as e:
         print(f"OB/OS cache build failed: {e}")
 

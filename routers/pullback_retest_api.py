@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException
 
@@ -13,43 +14,37 @@ router = APIRouter()
 CACHE_PATH = Path("data/cache/pullback_retest_latest.json")
 
 
+def _read_cached_payload() -> Dict[str, Any]:
+    with CACHE_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 @router.get("/website/pullback-retest/latest")
-def get_pullback_retest_latest():
-    # Serve cache first
+def get_pullback_retest_latest() -> Dict[str, Any]:
     if CACHE_PATH.exists():
         try:
-            with CACHE_PATH.open("r", encoding="utf-8") as f:
-                return json.load(f)
+            return _read_cached_payload()
         except Exception as e:
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to read Pullback/Retest cache: {e}"
+                detail=f"Failed to read pullback/retest cache: {e}",
             )
 
-    # Fallback to live build
     try:
-        df = load_price_data().tail(5000).copy()
+        df = load_price_data().tail(2000).copy()
 
         if df.empty:
             raise HTTPException(
                 status_code=500,
-                detail="Price data is empty"
+                detail="Pullback/Retest live build failed: empty dataset",
             )
 
-        payload = build_pullback_retest_latest_payload(df)
-
-        if not payload:
-            raise HTTPException(
-                status_code=500,
-                detail="Pullback/Retest payload build returned empty result"
-            )
-
-        return payload
+        return build_pullback_retest_latest_payload(df=df)
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to build Pullback/Retest payload: {e}"
+            detail=f"Failed to build pullback/retest payload: {e}",
         )

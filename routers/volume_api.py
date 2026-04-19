@@ -4,10 +4,12 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
-import pandas as pd
 from fastapi import APIRouter, HTTPException
 
 from core.m_volume import build_volume_latest_payload
+from services.build_volume_cache import build_volume_cache
+from services.market_data import get_ohlcv_df
+
 
 router = APIRouter(prefix="/website/volume", tags=["website-volume"])
 
@@ -22,26 +24,12 @@ def _load_cache() -> Dict[str, Any]:
         return json.load(f)
 
 
-def _get_ohlcv_df() -> pd.DataFrame:
-    """
-    Pull the live OHLCV dataframe from the project's existing data pipeline.
-    Lazy import avoids top-level circular import issues.
-    """
-    from main_api import get_ohlcv_df
-
+def _build_live_payload() -> Dict[str, Any]:
     df = get_ohlcv_df()
 
     if df is None or len(df) == 0:
-        raise ValueError("No OHLCV data returned.")
+        raise ValueError("No OHLCV data returned from market data service.")
 
-    if not isinstance(df, pd.DataFrame):
-        raise ValueError("OHLCV loader did not return a pandas DataFrame.")
-
-    return df
-
-
-def _build_live_payload() -> Dict[str, Any]:
-    df = _get_ohlcv_df()
     return build_volume_latest_payload(df)
 
 
@@ -57,3 +45,14 @@ def get_volume_latest() -> Dict[str, Any]:
                 status_code=500,
                 detail=f"Failed to load volume payload from cache or live build: {e}",
             )
+
+
+@router.get("/rebuild")
+def rebuild_volume_latest() -> Dict[str, Any]:
+    try:
+        return build_volume_cache()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to rebuild volume cache: {e}",
+        )

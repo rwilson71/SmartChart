@@ -186,7 +186,33 @@ def dir_color(v: float) -> str:
     if v < -0.20:
         return "maroon"
     return "gray"
+def derive_market_bias(mtf_avg: float) -> str:
+    if mtf_avg > 0.20:
+        return "BULLISH"
+    if mtf_avg < -0.20:
+        return "BEARISH"
+    return "NEUTRAL"
 
+
+def derive_confluence_state_label(
+    cc_active_zone: bool,
+    cc_is_confluent: bool,
+    cc_in_structural_zone: bool,
+    cc_direction: str,
+) -> str:
+    direction = str(cc_direction).upper()
+
+    if cc_active_zone and direction == "BULL":
+        return "ACTIVE BULL CONFLUENCE"
+    if cc_active_zone and direction == "BEAR":
+        return "ACTIVE BEAR CONFLUENCE"
+    if cc_is_confluent and direction == "BULL":
+        return "BULL CONFLUENCE"
+    if cc_is_confluent and direction == "BEAR":
+        return "BEAR CONFLUENCE"
+    if cc_in_structural_zone:
+        return "STRUCTURAL ZONE ONLY"
+    return "NEUTRAL"
 
 # =============================================================================
 # OUTPUT CONTRACT
@@ -483,11 +509,6 @@ def run_confluence_cloud_engine(
     latest = engine.latest(df)
     return asdict(latest)
 
-
-# =============================================================================
-# WEBSITE PAYLOAD BUILDER
-# =============================================================================
-
 def build_confluence_cloud_latest_payload(
     df: pd.DataFrame,
     config: Optional[ConfluenceCloudConfig] = None,
@@ -497,12 +518,29 @@ def build_confluence_cloud_latest_payload(
 
     zone_ready = latest.zone_top is not None and latest.zone_bottom is not None
 
+    state_label = derive_confluence_state_label(
+        cc_active_zone=latest.cc_active_zone,
+        cc_is_confluent=latest.cc_is_confluent,
+        cc_in_structural_zone=latest.cc_in_structural_zone,
+        cc_direction=latest.cc_direction,
+    )
+
+    market_bias = derive_market_bias(latest.mtf_avg)
+
     payload = {
         "indicator": "confluence_cloud",
-        "debug_version": "confluence_cloud_payload_v1",
+        "debug_version": "confluence_cloud_payload_v2",
         "timestamp": str(latest.timestamp),
 
-        "state": {
+        # Shared website contract
+        "state": state_label,
+        "bias_signal": latest.cc_dir,
+        "bias_label": latest.cc_direction,
+        "indicator_strength": round(latest.cc_strength_score, 4),
+        "market_bias": market_bias,
+
+        # Detailed state block preserved for specialist UI / future dashboard use
+        "state_detail": {
             "is_confluent": latest.cc_is_confluent,
             "in_structural_zone": latest.cc_in_structural_zone,
             "active_zone": latest.cc_active_zone,

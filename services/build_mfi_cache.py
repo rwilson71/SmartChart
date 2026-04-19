@@ -1,39 +1,42 @@
+from __future__ import annotations
+
 import json
 import time
 from pathlib import Path
-
-import pandas as pd
+from typing import Any, Dict
 
 from core.data_loader import load_price_data
 from core.q_mfi import build_mfi_latest_payload
 
-DATA_PATH = Path("data/xauusd.csv")
+
 CACHE_PATH = Path("data/cache/mfi_latest.json")
 REFRESH_SECONDS = 10
 
 
-def run_mfi_build() -> None:
+def run_mfi_build() -> Dict[str, Any] | None:
     try:
         df = load_price_data().tail(5000).copy()
 
         if df.empty:
             print("MFI build error: empty dataset")
-            return
+            return None
 
         payload = build_mfi_latest_payload(df)
 
         if not payload:
             print("MFI build error: empty payload")
-            return
+            return None
 
         CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with CACHE_PATH.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+            json.dump(payload, f, indent=2, default=str)
 
         print(f"MFI cache updated: {CACHE_PATH}")
+        return payload
 
     except Exception as e:
         print(f"MFI build error: {e}")
+        return None
 
 
 if __name__ == "__main__":

@@ -533,11 +533,6 @@ def run_regime(
 ) -> pd.DataFrame:
     return calculate_regime(df, config=config)
 
-
-# =============================================================================
-# WEBSITE PAYLOAD BUILDER
-# =============================================================================
-
 def build_regime_latest_payload(
     df: pd.DataFrame,
     config: Optional[RegimeConfig] = None,
@@ -553,21 +548,47 @@ def build_regime_latest_payload(
     regime_state = _safe_int(last.get("regime_state_export", 0))
     market_state = _safe_int(last.get("market_state_export", 0))
     regime_bias = _safe_int(last.get("regime_bias_export", 0))
+    regime_strength = round(_safe_float(last.get("regime_strength_export", 0.0)), 6)
+
+    regime_label = _safe_str(last.get("regime_label", "unknown"))
+    market_label = _safe_str(last.get("market_condition_label", "unknown"))
+    regime_bias_label = _bias_text(regime_bias)
+
+    # Shared website / Ultimate Truth contract
+    state = regime_label
+    bias_signal = regime_bias
+    bias_label = regime_bias_label.upper()
+    indicator_strength = regime_strength
+
+    if regime_state == 1:
+        market_bias = regime_bias_label.upper()
+    elif regime_state == 2:
+        market_bias = "NEUTRAL"
+    else:
+        market_bias = "TRANSITION"
 
     payload: Dict[str, Any] = {
         "indicator": "regime",
-        "debug_version": "regime_payload_v1",
+        "debug_version": "regime_payload_v2",
         "timestamp": _safe_timestamp(ts_value),
 
+        # Shared Ultimate Truth / website contract
+        "state": state,
+        "bias_signal": bias_signal,
+        "bias_label": bias_label,
+        "indicator_strength": indicator_strength,
+        "market_bias": market_bias,
+
+        # Specialist regime fields
         "regime_state": regime_state,
-        "regime_label": _safe_str(last.get("regime_label", "unknown")),
+        "regime_label": regime_label,
         "regime_bias": regime_bias,
-        "regime_bias_label": _bias_text(regime_bias),
-        "regime_strength": round(_safe_float(last.get("regime_strength_export", 0.0)), 6),
+        "regime_bias_label": regime_bias_label,
+        "regime_strength": regime_strength,
         "regime_change": _safe_int(last.get("regime_change_export", 0)),
 
         "market_state": market_state,
-        "market_label": _safe_str(last.get("market_condition_label", "unknown")),
+        "market_label": market_label,
         "market_change": _safe_int(last.get("market_change_export", 0)),
 
         "trend_condition": _safe_int(last.get("trend_condition_export", 0)),

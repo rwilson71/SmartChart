@@ -783,10 +783,42 @@ def run_ob_os_engine(
 
     return out
 
-
 # =============================================================================
 # PAYLOAD BUILDER
 # =============================================================================
+
+def _website_bias_signal(state: int) -> int:
+    if state > 0:
+        return 1
+    if state < 0:
+        return -1
+    return 0
+
+
+def _website_bias_label(signal: int) -> str:
+    if signal > 0:
+        return "BULLISH"
+    if signal < 0:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _website_market_bias(signal: int) -> str:
+    if signal > 0:
+        return "BULLISH"
+    if signal < 0:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _website_indicator_strength(row: pd.Series) -> float:
+    active_score = _num(row.get("sc_obos_active_score"), 0.0)
+    reversal_strength = _num(row.get("sc_reversal_strength"), 0.0)
+    continuation_strength = _num(row.get("sc_continuation_strength"), 0.0)
+
+    strength = max(active_score, reversal_strength, continuation_strength) * 100.0
+    return float(np.clip(strength, 0.0, 100.0))
+
 
 def build_ob_os_latest_payload(
     df: pd.DataFrame,
@@ -810,27 +842,45 @@ def build_ob_os_latest_payload(
     else:
         timestamp_iso = str(timestamp)
 
-    state = _int(row.get("sc_obos_state_final", 0))
+    raw_state = _int(row.get("sc_obos_state_final", 0))
+    state_text = _state_text(raw_state)
     grade = _int(row.get("sc_obos_grade", 0))
     div_state = _int(row.get("sc_div_state", 0))
     stretch_state = _int(row.get("sc_stretch_state", 0))
     obos_dir = _int(row.get("sc_obos_dir", 0))
     mtf_dir = _int(row.get("sc_mtf_dir", 0))
 
+    bias_signal = _website_bias_signal(raw_state)
+    bias_label = _website_bias_label(bias_signal)
+    market_bias = _website_market_bias(bias_signal)
+    indicator_strength = _website_indicator_strength(row)
+
     payload: Dict[str, Any] = {
-        "debug_version": "ob_os_payload_v1",
+        "debug_version": "ob_os_payload_v2",
         "indicator": "o_ob_os",
         "title": "OB/OS + Divergence Engine",
+
+        # ---------------------------------------------------------------------
+        # Standard website contract
+        # ---------------------------------------------------------------------
         "timestamp": timestamp_iso,
+        "state": state_text,
+        "bias_signal": bias_signal,
+        "bias_label": bias_label,
+        "indicator_strength": round(indicator_strength, 2),
+        "market_bias": market_bias,
+
+        # ---------------------------------------------------------------------
+        # Raw / specialist state
+        # ---------------------------------------------------------------------
+        "raw_state": raw_state,
+        "state_text": state_text,
+        "grade": grade,
+        "grade_text": _grade_text(grade),
 
         "composite": round(_num(row.get("sc_obos_composite")), 6),
         "signal": round(_num(row.get("sc_obos_signal")), 6),
         "mtf_avg": round(_num(row.get("sc_mtf_avg")), 6),
-
-        "state": state,
-        "state_text": _state_text(state),
-        "grade": grade,
-        "grade_text": _grade_text(grade),
 
         "obos_state": _int(row.get("sc_obos_state", 0)),
         "stretch_state": stretch_state,
