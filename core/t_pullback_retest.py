@@ -102,7 +102,22 @@ def _within_tolerance(
     level: pd.Series,
     tol: pd.Series,
 ) -> pd.Series:
-    return (price_low <= (level + tol)) & (price_high >= (level - tol))
+    return level.notna() & (price_low <= (level + tol)) & (price_high >= (level - tol))
+
+
+def _zone_touch(
+    price_low: pd.Series,
+    price_high: pd.Series,
+    zone_lo: pd.Series,
+    zone_hi: pd.Series,
+    tol: pd.Series,
+) -> pd.Series:
+    return (
+        zone_lo.notna()
+        & zone_hi.notna()
+        & (price_low <= (zone_hi + tol))
+        & (price_high >= (zone_lo - tol))
+    )
 
 
 def _rolling_pivot_high(high: pd.Series, left: int, right: int) -> pd.Series:
@@ -250,6 +265,20 @@ def _to_native(value: Any) -> Any:
     return value
 
 
+def _get_reindexed_series(
+    source_df: Optional[pd.DataFrame],
+    index: pd.Index,
+    candidates: list[str],
+) -> pd.Series:
+    if source_df is None:
+        return pd.Series(np.nan, index=index, dtype=float)
+
+    for col in candidates:
+        if col in source_df.columns:
+            return pd.to_numeric(source_df[col].reindex(index), errors="coerce")
+    return pd.Series(np.nan, index=index, dtype=float)
+
+
 # =============================================================================
 # CORE
 # =============================================================================
@@ -259,13 +288,15 @@ def calculate_pullback_retest(
     config: Optional[PullbackRetestConfig] = None,
     confluence_df: Optional[pd.DataFrame] = None,
     trend_df: Optional[pd.DataFrame] = None,
+    fvg_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     SmartChart Pullback / Retest Engine
 
     Optional inputs:
-    - confluence_df: may contain conf_zone_lo_export / conf_zone_hi_export
+    - confluence_df: may contain cloud zone and/or confluence zone fields
     - trend_df: may contain trend direction export if available
+    - fvg_df: may contain active FVG zone fields
 
     If trend_df is not provided, direction is inferred from EMA stack.
     """
@@ -400,30 +431,48 @@ def calculate_pullback_retest(
     out["rt_prev_day_low_ttl"] = prev_day_low_ttl["touch_ttl"]
 
     # -------------------------------------------------------------------------
-    # FIRST 5M / 15M SESSION CANDLE H/L
+    # FIRST 5M / 15M / 1H / 4H SESSION CANDLE H/L
     # -------------------------------------------------------------------------
     first_5m = _first_bar_levels(base, "5min")
     first_15m = _first_bar_levels(base, "15min")
+    first_1h = _first_bar_levels(base, "1h")
+    first_4h = _first_bar_levels(base, "4h")
 
     first_5m_high = first_5m["first_5min_high"]
     first_5m_low = first_5m["first_5min_low"]
     first_15m_high = first_15m["first_15min_high"]
     first_15m_low = first_15m["first_15min_low"]
+    first_1h_high = first_1h["first_1h_high"]
+    first_1h_low = first_1h["first_1h_low"]
+    first_4h_high = first_4h["first_4h_high"]
+    first_4h_low = first_4h["first_4h_low"]
 
     rt_first_5m_high_now = _within_tolerance(base["low"], base["high"], first_5m_high, tol)
     rt_first_5m_low_now = _within_tolerance(base["low"], base["high"], first_5m_low, tol)
     rt_first_15m_high_now = _within_tolerance(base["low"], base["high"], first_15m_high, tol)
     rt_first_15m_low_now = _within_tolerance(base["low"], base["high"], first_15m_low, tol)
+    rt_first_1h_high_now = _within_tolerance(base["low"], base["high"], first_1h_high, tol)
+    rt_first_1h_low_now = _within_tolerance(base["low"], base["high"], first_1h_low, tol)
+    rt_first_4h_high_now = _within_tolerance(base["low"], base["high"], first_4h_high, tol)
+    rt_first_4h_low_now = _within_tolerance(base["low"], base["high"], first_4h_low, tol)
 
     first_5m_high_ttl = _ttl_flag(rt_first_5m_high_now, cfg.ttl_bars)
     first_5m_low_ttl = _ttl_flag(rt_first_5m_low_now, cfg.ttl_bars)
     first_15m_high_ttl = _ttl_flag(rt_first_15m_high_now, cfg.ttl_bars)
     first_15m_low_ttl = _ttl_flag(rt_first_15m_low_now, cfg.ttl_bars)
+    first_1h_high_ttl = _ttl_flag(rt_first_1h_high_now, cfg.ttl_bars)
+    first_1h_low_ttl = _ttl_flag(rt_first_1h_low_now, cfg.ttl_bars)
+    first_4h_high_ttl = _ttl_flag(rt_first_4h_high_now, cfg.ttl_bars)
+    first_4h_low_ttl = _ttl_flag(rt_first_4h_low_now, cfg.ttl_bars)
 
     out["first_5m_high"] = first_5m_high
     out["first_5m_low"] = first_5m_low
     out["first_15m_high"] = first_15m_high
     out["first_15m_low"] = first_15m_low
+    out["first_1h_high"] = first_1h_high
+    out["first_1h_low"] = first_1h_low
+    out["first_4h_high"] = first_4h_high
+    out["first_4h_low"] = first_4h_low
 
     out["rt_first_5m_high_now"] = first_5m_high_ttl["touch_now"]
     out["rt_first_5m_high_active"] = first_5m_high_ttl["touch_active"]
@@ -441,29 +490,38 @@ def calculate_pullback_retest(
     out["rt_first_15m_low_active"] = first_15m_low_ttl["touch_active"]
     out["rt_first_15m_low_ttl"] = first_15m_low_ttl["touch_ttl"]
 
+    out["rt_first_1h_high_now"] = first_1h_high_ttl["touch_now"]
+    out["rt_first_1h_high_active"] = first_1h_high_ttl["touch_active"]
+    out["rt_first_1h_high_ttl"] = first_1h_high_ttl["touch_ttl"]
+
+    out["rt_first_1h_low_now"] = first_1h_low_ttl["touch_now"]
+    out["rt_first_1h_low_active"] = first_1h_low_ttl["touch_active"]
+    out["rt_first_1h_low_ttl"] = first_1h_low_ttl["touch_ttl"]
+
+    out["rt_first_4h_high_now"] = first_4h_high_ttl["touch_now"]
+    out["rt_first_4h_high_active"] = first_4h_high_ttl["touch_active"]
+    out["rt_first_4h_high_ttl"] = first_4h_high_ttl["touch_ttl"]
+
+    out["rt_first_4h_low_now"] = first_4h_low_ttl["touch_now"]
+    out["rt_first_4h_low_active"] = first_4h_low_ttl["touch_active"]
+    out["rt_first_4h_low_ttl"] = first_4h_low_ttl["touch_ttl"]
+
     # -------------------------------------------------------------------------
     # CONFLUENCE CLOUD ZONE RETEST
     # -------------------------------------------------------------------------
-    if confluence_df is not None:
-        if "conf_zone_lo_export" in confluence_df.columns:
-            cloud_lo = confluence_df["conf_zone_lo_export"].reindex(base.index)
-        elif "loc_lo" in confluence_df.columns:
-            cloud_lo = confluence_df["loc_lo"].reindex(base.index)
-        else:
-            cloud_lo = pd.Series(np.nan, index=base.index)
-
-        if "conf_zone_hi_export" in confluence_df.columns:
-            cloud_hi = confluence_df["conf_zone_hi_export"].reindex(base.index)
-        elif "loc_hi" in confluence_df.columns:
-            cloud_hi = confluence_df["loc_hi"].reindex(base.index)
-        else:
-            cloud_hi = pd.Series(np.nan, index=base.index)
-    else:
-        cloud_lo = pd.Series(np.nan, index=base.index)
-        cloud_hi = pd.Series(np.nan, index=base.index)
+    cloud_lo = _get_reindexed_series(
+        confluence_df,
+        base.index,
+        ["conf_zone_lo_export", "cloud_zone_lo", "cloud_lo", "loc_lo"],
+    )
+    cloud_hi = _get_reindexed_series(
+        confluence_df,
+        base.index,
+        ["conf_zone_hi_export", "cloud_zone_hi", "cloud_hi", "loc_hi"],
+    )
 
     cloud_mid = (cloud_lo + cloud_hi) / 2.0
-    rt_cloud_now = cloud_lo.notna() & cloud_hi.notna() & (base["low"] <= cloud_hi) & (base["high"] >= cloud_lo)
+    rt_cloud_now = _zone_touch(base["low"], base["high"], cloud_lo, cloud_hi, tol)
     cloud_ttl = _ttl_flag(rt_cloud_now, cfg.ttl_bars)
 
     out["conf_cloud_lo"] = cloud_lo
@@ -472,6 +530,56 @@ def calculate_pullback_retest(
     out["rt_conf_cloud_now"] = cloud_ttl["touch_now"]
     out["rt_conf_cloud_active"] = cloud_ttl["touch_active"]
     out["rt_conf_cloud_ttl"] = cloud_ttl["touch_ttl"]
+
+    # -------------------------------------------------------------------------
+    # CONFLUENCE ZONE RETEST
+    # -------------------------------------------------------------------------
+    conf_zone_lo = _get_reindexed_series(
+        confluence_df,
+        base.index,
+        ["confluence_zone_lo_export", "confluence_zone_lo", "zone_lo", "conf_lo"],
+    )
+    conf_zone_hi = _get_reindexed_series(
+        confluence_df,
+        base.index,
+        ["confluence_zone_hi_export", "confluence_zone_hi", "zone_hi", "conf_hi"],
+    )
+
+    conf_zone_mid = (conf_zone_lo + conf_zone_hi) / 2.0
+    rt_conf_zone_now = _zone_touch(base["low"], base["high"], conf_zone_lo, conf_zone_hi, tol)
+    conf_zone_ttl = _ttl_flag(rt_conf_zone_now, cfg.ttl_bars)
+
+    out["confluence_zone_lo"] = conf_zone_lo
+    out["confluence_zone_hi"] = conf_zone_hi
+    out["confluence_zone_mid"] = conf_zone_mid
+    out["rt_confluence_zone_now"] = conf_zone_ttl["touch_now"]
+    out["rt_confluence_zone_active"] = conf_zone_ttl["touch_active"]
+    out["rt_confluence_zone_ttl"] = conf_zone_ttl["touch_ttl"]
+
+    # -------------------------------------------------------------------------
+    # FVG RETEST
+    # -------------------------------------------------------------------------
+    fvg_lo = _get_reindexed_series(
+        fvg_df,
+        base.index,
+        ["fvg_lo_export", "fvg_zone_lo", "active_fvg_lo", "zone_lo", "fvg_lo"],
+    )
+    fvg_hi = _get_reindexed_series(
+        fvg_df,
+        base.index,
+        ["fvg_hi_export", "fvg_zone_hi", "active_fvg_hi", "zone_hi", "fvg_hi"],
+    )
+
+    fvg_mid = (fvg_lo + fvg_hi) / 2.0
+    rt_fvg_now = _zone_touch(base["low"], base["high"], fvg_lo, fvg_hi, tol)
+    fvg_ttl = _ttl_flag(rt_fvg_now, cfg.ttl_bars)
+
+    out["fvg_lo"] = fvg_lo
+    out["fvg_hi"] = fvg_hi
+    out["fvg_mid"] = fvg_mid
+    out["rt_fvg_now"] = fvg_ttl["touch_now"]
+    out["rt_fvg_active"] = fvg_ttl["touch_active"]
+    out["rt_fvg_ttl"] = fvg_ttl["touch_ttl"]
 
     # -------------------------------------------------------------------------
     # FIB RETESTS
@@ -567,6 +675,10 @@ def calculate_pullback_retest(
         | (out["rt_first_5m_low_active"] == 1)
         | (out["rt_first_15m_high_active"] == 1)
         | (out["rt_first_15m_low_active"] == 1)
+        | (out["rt_first_1h_high_active"] == 1)
+        | (out["rt_first_1h_low_active"] == 1)
+        | (out["rt_first_4h_high_active"] == 1)
+        | (out["rt_first_4h_low_active"] == 1)
     ).astype(int)
 
     out["rt_any_fib"] = (
@@ -579,12 +691,16 @@ def calculate_pullback_retest(
     ).astype(int)
 
     out["rt_any_cloud"] = (out["rt_conf_cloud_active"] == 1).astype(int)
+    out["rt_any_confluence"] = (out["rt_confluence_zone_active"] == 1).astype(int)
+    out["rt_any_fvg"] = (out["rt_fvg_active"] == 1).astype(int)
 
     out["rt_any"] = (
         (out["rt_any_ema"] == 1)
         | (out["rt_any_structure"] == 1)
         | (out["rt_any_fib"] == 1)
         | (out["rt_any_cloud"] == 1)
+        | (out["rt_any_confluence"] == 1)
+        | (out["rt_any_fvg"] == 1)
     ).astype(int)
 
     # -------------------------------------------------------------------------
@@ -659,6 +775,29 @@ def calculate_pullback_retest(
         + displacement_score * 0.15
     ).clip(0.0, 1.0)
 
+    delta_bull_score = (bull_score * 100.0).clip(0.0, 100.0)
+    delta_bear_score = -(bear_score * 100.0).clip(0.0, 100.0)
+
+    delta_winner_score = pd.Series(
+        np.where(
+            bull_score > bear_score,
+            delta_bull_score,
+            np.where(bear_score > bull_score, delta_bear_score, 0.0),
+        ),
+        index=base.index,
+        dtype=float,
+    )
+
+    delta_winner_label = pd.Series(
+        np.where(
+            bull_score > bear_score,
+            "bull",
+            np.where(bear_score > bull_score, "bear", "neutral"),
+        ),
+        index=base.index,
+        dtype="object",
+    )
+
     final_trigger_score = pd.Series(
         np.where(
             trend_dir > 0,
@@ -712,6 +851,11 @@ def calculate_pullback_retest(
     out["trigger_bias"] = trigger_bias.astype(int)
     out["trigger_bias_label"] = trigger_bias_label
 
+    out["delta_bull_score"] = delta_bull_score.astype(float)
+    out["delta_bear_score"] = delta_bear_score.astype(float)
+    out["delta_winner_score"] = delta_winner_score.astype(float)
+    out["delta_winner_label"] = delta_winner_label
+
     # -------------------------------------------------------------------------
     # EXPORT CONTRACT
     # -------------------------------------------------------------------------
@@ -720,6 +864,8 @@ def calculate_pullback_retest(
         "rt_ema3350_active",
         "rt_ema100200_active",
         "rt_conf_cloud_active",
+        "rt_confluence_zone_active",
+        "rt_fvg_active",
         "rt_session_high_active",
         "rt_session_low_active",
         "rt_prev_day_high_active",
@@ -728,6 +874,10 @@ def calculate_pullback_retest(
         "rt_first_5m_low_active",
         "rt_first_15m_high_active",
         "rt_first_15m_low_active",
+        "rt_first_1h_high_active",
+        "rt_first_1h_low_active",
+        "rt_first_4h_high_active",
+        "rt_first_4h_low_active",
         "rt_fib25_active",
         "rt_fib33_active",
         "rt_fib50_active",
@@ -738,6 +888,8 @@ def calculate_pullback_retest(
         "rt_any_structure",
         "rt_any_fib",
         "rt_any_cloud",
+        "rt_any_confluence",
+        "rt_any_fvg",
         "rt_any",
     ]
 
@@ -753,8 +905,10 @@ def calculate_pullback_retest(
                 "rt_any_structure",
                 "rt_any_fib",
                 "rt_any_cloud",
+                "rt_any_confluence",
+                "rt_any_fvg",
             ]
-        ].sum(axis=1) / 4.0
+        ].sum(axis=1) / 6.0
     ).astype(float)
 
     out["pb_signal"] = (
@@ -774,12 +928,14 @@ def build_pullback_retest(
     config: Optional[PullbackRetestConfig] = None,
     confluence_df: Optional[pd.DataFrame] = None,
     trend_df: Optional[pd.DataFrame] = None,
+    fvg_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     return calculate_pullback_retest(
         df=df,
         config=config,
         confluence_df=confluence_df,
         trend_df=trend_df,
+        fvg_df=fvg_df,
     )
 
 
@@ -788,12 +944,14 @@ def run_pullback_retest(
     config: Optional[PullbackRetestConfig] = None,
     confluence_df: Optional[pd.DataFrame] = None,
     trend_df: Optional[pd.DataFrame] = None,
+    fvg_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     return calculate_pullback_retest(
         df=df,
         config=config,
         confluence_df=confluence_df,
         trend_df=trend_df,
+        fvg_df=fvg_df,
     )
 
 
@@ -809,6 +967,7 @@ def build_pullback_retest_latest_payload(
     config: Optional[Dict[str, Any]] = None,
     confluence_df: Optional[pd.DataFrame] = None,
     trend_df: Optional[pd.DataFrame] = None,
+    fvg_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     cfg_dict = DEFAULT_PULLBACK_RETEST_CONFIG.copy()
     if config:
@@ -821,6 +980,7 @@ def build_pullback_retest_latest_payload(
         config=cfg,
         confluence_df=confluence_df,
         trend_df=trend_df,
+        fvg_df=fvg_df,
     )
 
     if result.empty:
@@ -852,6 +1012,10 @@ def build_pullback_retest_latest_payload(
         active_groups.append("fib")
     if int(_to_native(last.get("rt_any_cloud_export", 0)) or 0) == 1:
         active_groups.append("cloud")
+    if int(_to_native(last.get("rt_any_confluence_export", 0)) or 0) == 1:
+        active_groups.append("confluence")
+    if int(_to_native(last.get("rt_any_fvg_export", 0)) or 0) == 1:
+        active_groups.append("fvg")
 
     if signal == 1 and strength >= 0.75:
         state_label = "strong_retest"
@@ -870,14 +1034,11 @@ def build_pullback_retest_latest_payload(
     else:
         bias_label = "NEUTRAL"
 
-    if signal == 1:
-        market_bias = bias_label
-    else:
-        market_bias = "NEUTRAL"
+    market_bias = bias_label if signal == 1 else "NEUTRAL"
 
     payload = {
         "indicator": "pullback_retest",
-        "debug_version": "pullback_retest_payload_v2",
+        "debug_version": "pullback_retest_payload_v3",
         "timestamp": last_idx.isoformat(),
 
         # Shared website / Ultimate Truth contract
@@ -895,7 +1056,7 @@ def build_pullback_retest_latest_payload(
         "state_label": state_label,
         "active_groups": active_groups,
 
-        # Trigger candle specialist fields
+        # Trigger candle / delta specialist fields
         "trigger_delta_strength": round(float(_to_native(last.get("trigger_delta_strength", 0.0)) or 0.0), 4),
         "trigger_bull_score": round(float(_to_native(last.get("trigger_bull_score", 0.0)) or 0.0), 4),
         "trigger_bear_score": round(float(_to_native(last.get("trigger_bear_score", 0.0)) or 0.0), 4),
@@ -912,6 +1073,12 @@ def build_pullback_retest_latest_payload(
         "trigger_close_pos": round(float(_to_native(last.get("trigger_close_pos", 0.0)) or 0.0), 4),
         "trigger_rel_volume": round(float(_to_native(last.get("trigger_rel_volume", 0.0)) or 0.0), 4),
 
+        # Delta section
+        "delta_bull_score": round(float(_to_native(last.get("delta_bull_score", 0.0)) or 0.0), 2),
+        "delta_bear_score": round(float(_to_native(last.get("delta_bear_score", 0.0)) or 0.0), 2),
+        "delta_winner_score": round(float(_to_native(last.get("delta_winner_score", 0.0)) or 0.0), 2),
+        "delta_winner_label": str(_to_native(last.get("delta_winner_label")) or "neutral"),
+
         "levels": {
             "ema14": _to_native(last.get("ema14")),
             "ema20": _to_native(last.get("ema20")),
@@ -927,9 +1094,19 @@ def build_pullback_retest_latest_payload(
             "first_5m_low": _to_native(last.get("first_5m_low")),
             "first_15m_high": _to_native(last.get("first_15m_high")),
             "first_15m_low": _to_native(last.get("first_15m_low")),
+            "first_1h_high": _to_native(last.get("first_1h_high")),
+            "first_1h_low": _to_native(last.get("first_1h_low")),
+            "first_4h_high": _to_native(last.get("first_4h_high")),
+            "first_4h_low": _to_native(last.get("first_4h_low")),
             "conf_cloud_lo": _to_native(last.get("conf_cloud_lo")),
             "conf_cloud_hi": _to_native(last.get("conf_cloud_hi")),
             "conf_cloud_mid": _to_native(last.get("conf_cloud_mid")),
+            "confluence_zone_lo": _to_native(last.get("confluence_zone_lo")),
+            "confluence_zone_hi": _to_native(last.get("confluence_zone_hi")),
+            "confluence_zone_mid": _to_native(last.get("confluence_zone_mid")),
+            "fvg_lo": _to_native(last.get("fvg_lo")),
+            "fvg_hi": _to_native(last.get("fvg_hi")),
+            "fvg_mid": _to_native(last.get("fvg_mid")),
             "fib25": _to_native(last.get("fib25")),
             "fib33": _to_native(last.get("fib33")),
             "fib50": _to_native(last.get("fib50")),
@@ -989,7 +1166,38 @@ def build_pullback_retest_latest_payload(
                     "active": int(_to_native(last.get("rt_first_15m_low_active_export", 0)) or 0),
                     "ttl": int(_to_native(last.get("rt_first_15m_low_ttl", 0)) or 0),
                 },
+                "first_1h_high": {
+                    "active": int(_to_native(last.get("rt_first_1h_high_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_first_1h_high_ttl", 0)) or 0),
+                },
+                "first_1h_low": {
+                    "active": int(_to_native(last.get("rt_first_1h_low_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_first_1h_low_ttl", 0)) or 0),
+                },
+                "first_4h_high": {
+                    "active": int(_to_native(last.get("rt_first_4h_high_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_first_4h_high_ttl", 0)) or 0),
+                },
+                "first_4h_low": {
+                    "active": int(_to_native(last.get("rt_first_4h_low_active_export", 0)) or 0),
+                    "ttl": int(_to_native(last.get("rt_first_4h_low_ttl", 0)) or 0),
+                },
                 "any": int(_to_native(last.get("rt_any_structure_export", 0)) or 0),
+            },
+            "cloud": {
+                "active": int(_to_native(last.get("rt_conf_cloud_active_export", 0)) or 0),
+                "ttl": int(_to_native(last.get("rt_conf_cloud_ttl", 0)) or 0),
+                "any": int(_to_native(last.get("rt_any_cloud_export", 0)) or 0),
+            },
+            "confluence": {
+                "active": int(_to_native(last.get("rt_confluence_zone_active_export", 0)) or 0),
+                "ttl": int(_to_native(last.get("rt_confluence_zone_ttl", 0)) or 0),
+                "any": int(_to_native(last.get("rt_any_confluence_export", 0)) or 0),
+            },
+            "fvg": {
+                "active": int(_to_native(last.get("rt_fvg_active_export", 0)) or 0),
+                "ttl": int(_to_native(last.get("rt_fvg_ttl", 0)) or 0),
+                "any": int(_to_native(last.get("rt_any_fvg_export", 0)) or 0),
             },
             "fib": {
                 "fib25": {
@@ -1017,11 +1225,6 @@ def build_pullback_retest_latest_payload(
                     "ttl": int(_to_native(last.get("rt_fib78_ttl", 0)) or 0),
                 },
                 "any": int(_to_native(last.get("rt_any_fib_export", 0)) or 0),
-            },
-            "cloud": {
-                "active": int(_to_native(last.get("rt_conf_cloud_active_export", 0)) or 0),
-                "ttl": int(_to_native(last.get("rt_conf_cloud_ttl", 0)) or 0),
-                "any": int(_to_native(last.get("rt_any_cloud_export", 0)) or 0),
             },
             "any": int(_to_native(last.get("rt_any_export", 0)) or 0),
         },
