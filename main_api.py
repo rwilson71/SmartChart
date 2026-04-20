@@ -37,6 +37,7 @@ from routers.fvg_api import router as fvg_router
 from routers.volume_api import router as volume_router
 from routers.x_1h_4h_first_candle_api import router as htf_first_candle_router
 from routers.w_5m_15m_first_candle_api import router as ltf_first_candle_router
+from routers.y_mtf_router import router as y_mtf_router
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -103,6 +104,7 @@ app.include_router(fvg_router)
 app.include_router(volume_router)
 app.include_router(htf_first_candle_router)
 app.include_router(ltf_first_candle_router)
+app.include_router(y_mtf_router)
 # =============================================================================
 # HELPERS
 # =============================================================================
