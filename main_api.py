@@ -38,6 +38,12 @@ from routers.volume_api import router as volume_router
 from routers.x_1h_4h_first_candle_api import router as htf_first_candle_router
 from routers.w_5m_15m_first_candle_api import router as ltf_first_candle_router
 from routers.y_mtf_router import router as y_mtf_router
+from routers.va_seasonality_router import router as seasonality_router
+from routers.vb_correlation_router import router as correlation_router
+from routers.vc_quant_router import router as quant_router
+from routers.vd_scanner_router import router as scanner_router
+from routers.ve_macro_router import router as macro_router
+from routers.vf_pattern_router import router as pattern_router
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -105,6 +111,12 @@ app.include_router(volume_router)
 app.include_router(htf_first_candle_router)
 app.include_router(ltf_first_candle_router)
 app.include_router(y_mtf_router)
+app.include_router(seasonality_router)
+app.include_router(correlation_router)
+app.include_router(quant_router)
+app.include_router(scanner_router)
+app.include_router(macro_router)
+app.include_router(pattern_router)
 # =============================================================================
 # HELPERS
 # =============================================================================

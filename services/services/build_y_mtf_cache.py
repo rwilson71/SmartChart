@@ -23,7 +23,7 @@ def build_y_mtf_cache() -> Dict[str, Any]:
 
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with CACHE_PATH.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+        json.dump(payload, f, indent=2, default=str)
 
     return payload
 
@@ -38,7 +38,9 @@ def run_y_mtf_cache_loop(refresh_seconds: int = REFRESH_SECONDS) -> None:
                 f"[Y_MTF] cache updated | "
                 f"timestamp={payload.get('timestamp', 'n/a')} | "
                 f"bias={payload.get('bias_label', 'n/a')} | "
-                f"strength={payload.get('indicator_strength', 'n/a')}"
+                f"strength={payload.get('indicator_strength', 'n/a')} | "
+                f"confidence={payload.get('mtf_confidence_label', 'n/a')} | "
+                f"agreement={payload.get('mtf_agreement_label', 'n/a')}"
             )
         except KeyboardInterrupt:
             print("[Y_MTF] cache loop stopped by user")
